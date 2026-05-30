@@ -1,0 +1,38 @@
+.git/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Training artifacts
+outputs/
+out/
+output/
+log/
+logs/
+*.log
+*.csv
+*.pth
+*.pth.tar
+model_best*.pth.tar
+best_checkpoint*.pth
+checkpoint*.pth
+last.pth.tar
+pid.txt
+
+# Python envs
+.venv/
+venv/
+env/
+
+# Keep vendored repos clean
+third_party/**/__pycache__/
+third_party/**/out/
+third_party/**/output/
+third_party/**/outputs/
+third_party/**/log/
+third_party/**/logs/
+third_party/**/*.py[cod]
+third_party/**/*.pth
+third_party/**/*.pth.tar
+third_party/**/*.log
+third_party/**/*.csv
