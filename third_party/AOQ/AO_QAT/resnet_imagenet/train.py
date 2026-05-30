@@ -1,6 +1,8 @@
 import os
 import sys
 import shutil
+import io
+import bisect
 import numpy as np
 import time, datetime
 import torch
@@ -8,6 +10,7 @@ import random
 import logging
 import argparse
 import torch.nn as nn
+from contextlib import nullcontext
 import torch.utils
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -21,6 +24,8 @@ from torchvision import datasets, transforms
 from torch.autograd import Variable
 import torchvision.models as models
 from collections import OrderedDict
+from PIL import Image
+import pyarrow.parquet as pq
 import quan
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from globalVal import globalVal
@@ -64,9 +69,172 @@ parser.add_argument(
     metavar="N",
     help="number of data loading workers (default: 4)",
 )
+parser.add_argument("--amp", action="store_true", help="enable autocast mixed precision")
+parser.add_argument(
+    "--amp_dtype",
+    type=str,
+    default="bf16",
+    choices=["bf16", "fp16"],
+    help="mixed precision dtype",
+)
+parser.add_argument("--channels_last", action="store_true", help="use channels_last memory format")
+parser.add_argument("--compile", action="store_true", help="compile teacher/student models")
+parser.add_argument("--compile_mode", type=str, default="default", help="torch.compile mode")
+parser.add_argument("--compile_backend", type=str, default="inductor", help="torch.compile backend")
+parser.add_argument("--prefetch_factor", type=int, default=4, help="dataloader prefetch factor")
+parser.add_argument("--persistent_workers", action="store_true", help="use persistent dataloader workers")
+parser.add_argument("--val_interval", type=int, default=1, help="validation interval in epochs")
+parser.add_argument("--plot_interval", type=int, default=0, help="histogram save interval, 0 disables plotting")
+parser.add_argument("--train_steps_per_epoch", type=int, default=0, help="limit train steps per epoch, 0 means full epoch")
+parser.add_argument("--val_steps", type=int, default=0, help="limit validation steps, 0 means full eval")
+parser.add_argument("--synthetic_data", action="store_true", help="use torchvision FakeData instead of on-disk ImageNet")
+parser.add_argument("--synthetic_train_size", type=int, default=32768, help="synthetic train dataset size")
+parser.add_argument("--synthetic_val_size", type=int, default=4096, help="synthetic validation dataset size")
+parser.add_argument(
+    "--dataset_format",
+    type=str,
+    default="imagefolder",
+    choices=["imagefolder", "parquet", "parquet-iter"],
+    help="dataset layout",
+)
+parser.add_argument("--skip_teacher_val", action="store_true", help="skip initial teacher validation")
+parser.add_argument("--print_model", action="store_true", help="print full student model")
+parser.add_argument("--print_params", action="store_true", help="print all parameter groups")
 args = parser.parse_args()
 
 CLASSES = 1000
+
+
+class ImageNetParquetDataset(torch.utils.data.Dataset):
+    def __init__(self, root, split="train", transform=None):
+        self.root = root
+        self.split = split
+        self.transform = transform
+        self.data_dir = os.path.join(root, "data") if os.path.isdir(os.path.join(root, "data")) else root
+        if not os.path.isdir(self.data_dir):
+            raise FileNotFoundError(f"parquet data dir not found: {self.data_dir}")
+
+        split_prefix = "validation" if split == "val" else split
+        self.files = sorted(
+            os.path.join(self.data_dir, f)
+            for f in os.listdir(self.data_dir)
+            if f.startswith(f"{split_prefix}-") and f.endswith(".parquet")
+        )
+        if not self.files:
+            raise FileNotFoundError(f"no parquet files for split={split_prefix} under {self.data_dir}")
+
+        self._row_groups = []
+        total_rows = 0
+        for file_idx, path in enumerate(self.files):
+            pf = pq.ParquetFile(path)
+            for rg_idx in range(pf.num_row_groups):
+                rg_rows = pf.metadata.row_group(rg_idx).num_rows
+                self._row_groups.append((total_rows, file_idx, rg_idx, rg_rows))
+                total_rows += rg_rows
+        self._total_rows = total_rows
+        self._cache_key = None
+        self._cache_rows = None
+
+    def __len__(self):
+        return self._total_rows
+
+    def _locate(self, index):
+        pos = bisect.bisect_right(self._row_groups, (index, float("inf"), float("inf"), float("inf"))) - 1
+        if pos < 0:
+            raise IndexError(index)
+        start, file_idx, rg_idx, rg_rows = self._row_groups[pos]
+        if index >= start + rg_rows:
+            raise IndexError(index)
+        return start, file_idx, rg_idx
+
+    def _load_row_group(self, file_idx, rg_idx):
+        key = (file_idx, rg_idx)
+        if self._cache_key != key:
+            table = pq.ParquetFile(self.files[file_idx]).read_row_group(rg_idx, columns=["image", "label"])
+            self._cache_rows = table.to_pylist()
+            self._cache_key = key
+        return self._cache_rows
+
+    def __getitem__(self, index):
+        start, file_idx, rg_idx = self._locate(index)
+        rows = self._load_row_group(file_idx, rg_idx)
+        sample = rows[index - start]
+        image = Image.open(io.BytesIO(sample["image"]["bytes"])).convert("RGB")
+        label = int(sample["label"])
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, label
+
+
+class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
+    def __init__(self, root, split="train", transform=None, shuffle=True, seed=42):
+        super().__init__()
+        self.root = root
+        self.split = split
+        self.transform = transform
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self.data_dir = os.path.join(root, "data") if os.path.isdir(os.path.join(root, "data")) else root
+        if not os.path.isdir(self.data_dir):
+            raise FileNotFoundError(f"parquet data dir not found: {self.data_dir}")
+
+        split_prefix = "validation" if split == "val" else split
+        self.files = sorted(
+            os.path.join(self.data_dir, f)
+            for f in os.listdir(self.data_dir)
+            if f.startswith(f"{split_prefix}-") and f.endswith(".parquet")
+        )
+        if not self.files:
+            raise FileNotFoundError(f"no parquet files for split={split_prefix} under {self.data_dir}")
+
+        self._row_groups = []
+        total_rows = 0
+        for path in self.files:
+            pf = pq.ParquetFile(path)
+            for rg_idx in range(pf.num_row_groups):
+                rg_rows = pf.metadata.row_group(rg_idx).num_rows
+                self._row_groups.append((path, rg_idx, rg_rows))
+                total_rows += rg_rows
+        self._total_rows = total_rows
+
+    def __len__(self):
+        return self._total_rows
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        info = torch.utils.data.get_worker_info()
+        num_workers = info.num_workers if info is not None else 1
+        worker_id = info.id if info is not None else 0
+
+        indices = list(range(len(self._row_groups)))
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(indices)
+        assigned = indices[worker_id::num_workers]
+        local_rng = random.Random(self.seed + self.epoch * 1009 + worker_id)
+
+        handles = {}
+        for rg_global_idx in assigned:
+            path, rg_idx, _ = self._row_groups[rg_global_idx]
+            pf = handles.get(path)
+            if pf is None:
+                pf = pq.ParquetFile(path)
+                handles[path] = pf
+            table = pf.read_row_group(rg_idx, columns=["image", "label"])
+            cols = table.to_pydict()
+            images = cols["image"]
+            labels = cols["label"]
+            order = list(range(len(images)))
+            if self.shuffle:
+                local_rng.shuffle(order)
+            for idx in order:
+                image = Image.open(io.BytesIO(images[idx]["bytes"])).convert("RGB")
+                if self.transform is not None:
+                    image = self.transform(image)
+                yield image, int(labels[idx])
 
 if not os.path.exists("log"):
     os.mkdir("log")
@@ -90,9 +258,16 @@ def main():
         sys.exit(1)
     start_t = time.time()
 
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
     cudnn.benchmark = True
     cudnn.enabled = True
     logging.info("args = %s", args)
+
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and args.amp_dtype == "fp16")
 
     # load model
     model_teacher = models.__dict__[args.teacher](weights="IMAGENET1K_V1")
@@ -111,8 +286,26 @@ def main():
     modules_to_replace = quan.find_modules_to_quantize(model_student, args.n_bit)
     model_student = quan.replace_module_by_names(model_student, modules_to_replace)
     model_student = model_student.to(device)
-    logging.info("student:")
-    logging.info(model_student)
+
+    if args.channels_last:
+        model_teacher = model_teacher.to(memory_format=torch.channels_last)
+        model_student = model_student.to(memory_format=torch.channels_last)
+
+    if args.compile and hasattr(torch, "compile"):
+        model_teacher = torch.compile(
+            model_teacher,
+            mode=args.compile_mode,
+            backend=args.compile_backend,
+        )
+        model_student = torch.compile(
+            model_student,
+            mode=args.compile_mode,
+            backend=args.compile_backend,
+        )
+
+    if args.print_model:
+        logging.info("student:")
+        logging.info(model_student)
 
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.to(device)
@@ -128,19 +321,24 @@ def main():
 
     for pname, p in model_student.named_parameters():
         if p.ndimension() == 4 and "bias" not in pname:
-            print("weight_param:", pname)
+            if args.print_params:
+                print("weight_param:", pname)
             weight_parameters.append(p)
         elif "quan_w_fn.mean_interval" in pname:
-            print("alpha_param:", pname)
+            if args.print_params:
+                print("alpha_param:", pname)
             alpha_parameters.append(p)
         elif "quan_a_fn.mean_interval" in pname:
-            print("beta_param:", pname)
+            if args.print_params:
+                print("beta_param:", pname)
             beta_parameters.append(p)
         elif "quan_w_fn.alpha" in pname:
-            print("theta_param:", pname)
+            if args.print_params:
+                print("theta_param:", pname)
             theta_parameters.append(p)
         else:
-            print("other_param:", pname)
+            if args.print_params:
+                print("other_param:", pname)
 
     weight_parameters_id = list(map(id, weight_parameters))
     alpha_parameters_id = list(map(id, alpha_parameters))
@@ -199,15 +397,15 @@ def main():
         start_epoch = checkpoint["epoch"] + 1
         best_top1_acc = checkpoint["best_top1_acc"]
         model_student.load_state_dict(checkpoint["state_dict"], strict=False)
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
         logging.info(
             "loaded checkpoint {} epoch = {}".format(
                 checkpoint_tar, checkpoint["epoch"]
             )
         )
-
-    # adjust the learning rate according to the checkpoint
-    for epoch in range(start_epoch):
-        scheduler.step()
 
     # load training data
     traindir = os.path.join(args.data, "train")
@@ -227,19 +425,70 @@ def main():
         ]
     )
 
-    train_dataset = datasets.ImageFolder(traindir, transform=train_transforms)
+    if args.synthetic_data:
+        train_dataset = datasets.FakeData(
+            size=args.synthetic_train_size,
+            image_size=(3, 224, 224),
+            num_classes=CLASSES,
+            transform=train_transforms,
+        )
+    elif args.dataset_format == "parquet-iter":
+        train_dataset = ImageNetParquetIterableDataset(
+            root=args.data,
+            split="train",
+            transform=train_transforms,
+            shuffle=True,
+        )
+    elif args.dataset_format == "parquet":
+        train_dataset = ImageNetParquetDataset(
+            root=args.data,
+            split="train",
+            transform=train_transforms,
+        )
+    else:
+        train_dataset = datasets.ImageFolder(traindir, transform=train_transforms)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=not isinstance(train_dataset, torch.utils.data.IterableDataset),
         num_workers=args.workers,
         pin_memory=True,
+        drop_last=True,
+        persistent_workers=args.persistent_workers and args.workers > 0,
+        prefetch_factor=args.prefetch_factor if args.workers > 0 else None,
     )
 
     # load validation data
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(
+    if args.synthetic_data:
+        val_dataset = datasets.FakeData(
+            size=args.synthetic_val_size,
+            image_size=(3, 224, 224),
+            num_classes=CLASSES,
+            transform=transforms.Compose(
+                [
+                    transforms.Resize(256),
+                    transforms.CenterCrop(224),
+                    transforms.ToTensor(),
+                    normalize,
+                ]
+            ),
+        )
+    elif args.dataset_format in {"parquet", "parquet-iter"}:
+        val_dataset = ImageNetParquetDataset(
+            root=args.data,
+            split="val",
+            transform=transforms.Compose(
+                [
+                    transforms.Resize(256),
+                    transforms.CenterCrop(224),
+                    transforms.ToTensor(),
+                    normalize,
+                ]
+            ),
+        )
+    else:
+        val_dataset = datasets.ImageFolder(
             valdir,
             transforms.Compose(
                 [
@@ -249,21 +498,27 @@ def main():
                     normalize,
                 ]
             ),
-        ),
+        )
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.workers,
         pin_memory=True,
+        persistent_workers=args.persistent_workers and args.workers > 0,
+        prefetch_factor=args.prefetch_factor if args.workers > 0 else None,
     )
 
-    print("教师网络的精度")
-    validate(-2, val_loader, model_teacher, criterion, args)
+    if not args.skip_teacher_val:
+        print("教师网络的精度")
+        validate(-2, val_loader, model_teacher, criterion, args, amp_dtype)
     # train the model
     model_student = model_student.to(device)
     epoch = start_epoch
 
     while epoch < args.epochs:
-        if epoch % 10 == 0:
+        if args.plot_interval > 0 and epoch % args.plot_interval == 0:
             fname = "epoch" + str(epoch) + ".png"
             plt.figure(1)
             plt.hist(
@@ -280,16 +535,23 @@ def main():
             criterion_kd,
             # criterion,
             optimizer,
-            scheduler,
+            scaler,
+            amp_dtype,
+            args,
         )
-        valid_obj, valid_top1_acc, valid_top5_acc = validate(
-            epoch, val_loader, model_student, criterion, args
-        )
+        if args.val_interval > 0 and epoch % args.val_interval == 0:
+            valid_obj, valid_top1_acc, valid_top5_acc = validate(
+                epoch, val_loader, model_student, criterion, args, amp_dtype
+            )
+        else:
+            valid_obj, valid_top1_acc, valid_top5_acc = train_obj, train_top1_acc, train_top5_acc
 
         is_best = False
         if valid_top1_acc > best_top1_acc:
             best_top1_acc = valid_top1_acc
             is_best = True
+
+        scheduler.step()
 
         save_checkpoint(
             {
@@ -297,6 +559,7 @@ def main():
                 "state_dict": model_student.state_dict(),
                 "best_top1_acc": best_top1_acc,
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
             },
             is_best,
             os.path.join(
@@ -316,7 +579,15 @@ def main():
 
 
 def train(
-    epoch, train_loader, model_student, model_teacher, criterion, optimizer, scheduler
+    epoch,
+    train_loader,
+    model_student,
+    model_teacher,
+    criterion,
+    optimizer,
+    scaler,
+    amp_dtype,
+    args,
 ):
     batch_time = AverageMeter("Time", ":6.3f")
     data_time = AverageMeter("Data", ":6.3f")
@@ -336,30 +607,36 @@ def train(
     # model_student.eval()
     model_teacher.eval()
     end = time.time()
-    scheduler.step()
 
     for param_group in optimizer.param_groups:
         cur_lr = param_group["lr"]
     print("learning_rate:", cur_lr)
 
     for i, (images, target) in enumerate(train_loader):
+        if args.train_steps_per_epoch > 0 and i >= args.train_steps_per_epoch:
+            break
         data_time.update(time.time() - end)
         # images = images.cuda()
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
+        if args.channels_last:
+            images = images.contiguous(memory_format=torch.channels_last)
         # target = target.cuda()
-        target = target.to(device)
+        target = target.to(device, non_blocking=True)
 
         # compute outputy
-        logits_student = model_student(images)
-        logits_teacher = model_teacher(images)
-        if globalVal.epoch <= 150:
-            globalVal.loss = 0.0
-            loss = criterion(logits_student, logits_teacher)
-        else:
-            loss1 = criterion(logits_student, logits_teacher)
-            loss2 = globalVal.loss
-            globalVal.loss = 0.0
-            loss = loss1 + 0.01 * loss2
+        amp_context = torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=args.amp)
+        with amp_context:
+            logits_student = model_student(images)
+            with torch.no_grad():
+                logits_teacher = model_teacher(images)
+            if globalVal.epoch <= 150:
+                globalVal.loss = 0.0
+                loss = criterion(logits_student, logits_teacher)
+            else:
+                loss1 = criterion(logits_student, logits_teacher)
+                loss2 = globalVal.loss
+                globalVal.loss = 0.0
+                loss = loss1 + 0.01 * loss2
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(logits_student, target, topk=(1, 5))
@@ -369,9 +646,14 @@ def train(
         top5.update(prec5.item(), n)
 
         # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -382,7 +664,7 @@ def train(
     return losses.avg, top1.avg, top5.avg
 
 
-def validate(epoch, val_loader, model, criterion, args):
+def validate(epoch, val_loader, model, criterion, args, amp_dtype):
     batch_time = AverageMeter("Time", ":6.3f")
     losses = AverageMeter("Loss", ":.4e")
     top1 = AverageMeter("Acc@1", ":6.2f")
@@ -396,14 +678,20 @@ def validate(epoch, val_loader, model, criterion, args):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
+            if args.val_steps > 0 and i >= args.val_steps:
+                break
             # images = images.cuda()
-            images = images.to(device)
+            images = images.to(device, non_blocking=True)
+            if args.channels_last:
+                images = images.contiguous(memory_format=torch.channels_last)
             # target = target.cuda()
-            target = target.to(device)
+            target = target.to(device, non_blocking=True)
 
             # compute output
-            logits = model(images)
-            loss = criterion(logits, target)
+            amp_context = torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=args.amp)
+            with amp_context:
+                logits = model(images)
+                loss = criterion(logits, target)
 
             # measure accuracy and record loss
             pred1, pred5 = accuracy(logits, target, topk=(1, 5))
