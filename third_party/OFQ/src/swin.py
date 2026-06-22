@@ -71,7 +71,8 @@ def shifted_window_attention(
     dropout: float = 0.0,
     qkv_bias: Optional[Tensor] = None,
     proj_bias: Optional[Tensor] = None,
-    qqkkvv: bool = False
+    qqkkvv: bool = False,
+    collect_attention: bool = False,
 ):
     """
     Window based multi-head self attention (W-MSA) module with relative position bias.
@@ -166,6 +167,8 @@ def shifted_window_attention(
         v_score = v_score / math.sqrt(C // num_heads)
         
         return x, (attn, q_score, k_score, v_score)
+    elif collect_attention:
+        return x, attn
     else:
         return x, None
 
@@ -248,7 +251,8 @@ class ShiftedWindowAttention(nn.Module):
             dropout=self.dropout,
             qkv_bias=self.qkv.bias,
             proj_bias=self.proj.bias,
-            qqkkvv = self.qqkkvv
+            qqkkvv = self.qqkkvv,
+            collect_attention=getattr(self, 'collect_attention', False),
         )
 
 
@@ -309,8 +313,9 @@ class SwinTransformerBlock(nn.Module):
     def forward(self, x):
 
         x = x[0]  
+        collect_attention = getattr(self, 'collect_attention', False) or getattr(self.attn, 'collect_attention', False)
               
-        if self.qqkkvv: 
+        if self.qqkkvv or collect_attention:
             temp_x, attn_mtrx = self.attn(self.norm1(x))
             x = x + self.stochastic_depth(temp_x)
             x = x + self.stochastic_depth(self.mlp(self.norm2(x)))
@@ -430,9 +435,13 @@ class SwinTransformer(nn.Module):
         ## blocks
         attn_matrixs = []
         for block in self.features[1:]:
-            x, attn_matrix = block(x)
-            x = (x, None)
-            attn_matrixs.append(attn_matrix)
+            if isinstance(block, nn.Sequential):
+                for sub_block in block:
+                    x, attn_matrix = sub_block(x)
+                    attn_matrixs.append(attn_matrix)
+                    x = (x, None)
+            else:
+                x = block(x)
 
         return x[0], attn_matrixs
         
@@ -551,6 +560,3 @@ def swin_t(*, drop_path = 0.2, pretrained = False, progress: bool = True, **kwar
         model.load_state_dict(checkpoint)
         
     return model
-
-
-

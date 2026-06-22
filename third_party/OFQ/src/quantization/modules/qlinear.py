@@ -39,18 +39,20 @@ class QLinear(nn.Linear):
         self.symmetric = symmetric
         self.weight_channelwise = weight_channelwise # not gonna used atm
         self.input_channelwise = input_channelwise
-        self.weight_quant_method = weight_quant_method
-        self.input_quant_method = input_quant_method
+        self.weight_quant_method = str(weight_quant_method).strip().lower()
+        self.input_quant_method = str(input_quant_method).strip().lower()
         self.input_quant_fn = LsqQuantizer(bit=input_bits,all_positive=(symmetric==False), learnable =  aq_learnable)
         self.pretrained_initialized = pretrained_initialized
         if pretrained_initialized != False:
             self.weight = torch.nn.Parameter(m.weight.detach())
             if m.bias is not None:
                 self.bias = torch.nn.Parameter(m.bias.detach())
-        if weight_quant_method == 'statsq':
+        if self.weight_quant_method == 'statsq':
             self.statsq_fn = StatsQuantizer(num_bits=self.weight_bits, clip_learnable=wq_learnable).to(m.weight.device)
+        elif self.weight_quant_method == 'lsq':
+            self.lsqw_fn = LsqQuantizerWeight(bit=weight_bits, per_channel=weight_channelwise, learnable=wq_learnable)
         else:
-            raise ValueError("Unknown quant_method")        
+            raise ValueError(f"Unknown quant_method: {weight_quant_method}")
 
         self.move_b4 = LearnableBias(self.weight.shape[1])
         self.move_aft = LearnableBias(self.weight.shape[1])
@@ -60,8 +62,10 @@ class QLinear(nn.Linear):
         # quantize weight
         if self.weight_quant_method == 'statsq':
             weight = self.statsq_fn(self.weight)
+        elif self.weight_quant_method == 'lsq':
+            weight = self.lsqw_fn(self.weight)
         else:
-            raise ValueError("Unknown quant_method")    
+            raise ValueError(f"Unknown quant_method: {self.weight_quant_method}")
         # quantize input
         input = self.move_b4(input)
         input = self.input_quant_fn(input)
@@ -361,8 +365,6 @@ class LSQ_w_and_act_QMLP(Mlp):
         x = self.fc2(x)
         x = self.drop2(x)
         return x
-
-
 
 
 

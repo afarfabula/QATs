@@ -23,7 +23,7 @@ import os
 import logging
 from collections import OrderedDict
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import torch
 import torch.nn as nn
@@ -75,6 +75,13 @@ except ImportError:
 
 torch.backends.cudnn.benchmark = True
 _logger = logging.getLogger('train')
+
+
+def format_eta_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
 
 # The first arg parser parses out only the --config argument, this argument is used to
 # load a yaml file containing key-values that override the defaults for the main parser below
@@ -1026,6 +1033,12 @@ def train_one_epoch(
         if last_batch or batch_idx % args.log_interval == 0:
             lrl = [param_group['lr'] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
+            remaining_batches_in_epoch = max(last_idx - batch_idx, 0)
+            remaining_epochs = max(int(getattr(args, 'epochs', epoch + 1)) - epoch - 1, 0)
+            remaining_batches_total = remaining_batches_in_epoch + remaining_epochs * len(loader)
+            eta_seconds = batch_time_m.avg * remaining_batches_total
+            eta_duration = format_eta_duration(eta_seconds)
+            eta_finish_time = (datetime.now() + timedelta(seconds=eta_seconds)).strftime('%Y-%m-%d %H:%M:%S')
 
             if args.distributed:
                 reduced_loss = reduce_tensor(loss.data, args.world_size)
@@ -1040,6 +1053,8 @@ def train_one_epoch(
                     'Loss: {loss.val:>9.6f} ({loss.avg:>6.4f})  '
                     'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s  '
                     '({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
+                    'ETA: {eta_duration}  '
+                    'Done: {eta_finish_time}  '
                     'LR: {lr:.3e}  '
                     'Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
                         epoch,
@@ -1049,6 +1064,8 @@ def train_one_epoch(
                         batch_time=batch_time_m,
                         rate=input.size(0) * args.world_size / batch_time_m.val,
                         rate_avg=input.size(0) * args.world_size / batch_time_m.avg,
+                        eta_duration=eta_duration,
+                        eta_finish_time=eta_finish_time,
                         lr=lr,
                         data_time=data_time_m))
 

@@ -247,6 +247,8 @@ class QAttention_swin(ShiftedWindowAttention):
             v_score = v_score / math.sqrt(C // self.num_heads)
             
             return x, (attn, q_score, k_score, v_score)
+        elif getattr(self, 'collect_attention', False):
+            return x, attn
         else:
             return x, None
         
@@ -457,6 +459,8 @@ class QAttention_swin_qkreparam(ShiftedWindowAttention):
             v_score = v_score / math.sqrt(C // self.num_heads)
             
             return x, (attn, q_score, k_score, v_score)
+        elif getattr(self, 'collect_attention', False):
+            return x, attn
         else:
             return x, None
         
@@ -667,9 +671,10 @@ class QAttention_swin_qkreparam_4_cga(ShiftedWindowAttention):
             v_score = v_score / math.sqrt(C // self.num_heads)
             
             return x, (attn, q_score, k_score, v_score)
+        elif getattr(self, 'collect_attention', False):
+            return x, attn
         else:
             return x, None
         
  
         
-

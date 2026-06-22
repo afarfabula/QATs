@@ -16,20 +16,24 @@ NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
 Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
 import argparse
+import copy
 import bisect
 import io
 import inspect
+import types
 import sys
 import time
 import yaml
 import os
+import shutil
 import logging
 import random as pyrandom
 from collections import OrderedDict
-from contextlib import suppress
-from datetime import datetime
+from contextlib import nullcontext, suppress
+from datetime import datetime, timedelta
 
 import torch
+import torch.serialization
 import torch.nn as nn
 import torchvision.utils
 from PIL import Image
@@ -57,6 +61,9 @@ from timm.utils import ApexScaler, NativeScaler
 from src import *
 import math
 
+if hasattr(torch.serialization, 'add_safe_globals'):
+    torch.serialization.add_safe_globals([argparse.Namespace, types.SimpleNamespace])
+
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -82,6 +89,13 @@ except ImportError:
 
 torch.backends.cudnn.benchmark = True
 _logger = logging.getLogger('train')
+
+
+def format_eta_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
 
 
 class ImageNetParquetDataset(Dataset):
@@ -153,7 +167,17 @@ class ImageNetParquetDataset(Dataset):
 
 
 class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
-    def __init__(self, root, split='train', transform=None, shuffle=True, seed=42):
+    def __init__(
+            self,
+            root,
+            split='train',
+            transform=None,
+            shuffle=True,
+            seed=42,
+            batch_size=None,
+            drop_last=False,
+            distributed_world_size=None,
+            distributed_rank=None):
         super().__init__()
         self.root = root
         self.split = split
@@ -161,6 +185,10 @@ class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
         self.shuffle = shuffle
         self.seed = seed
         self.epoch = 0
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.distributed_world_size = distributed_world_size
+        self.distributed_rank = distributed_rank
         self.data_dir = os.path.join(root, 'data') if os.path.isdir(os.path.join(root, 'data')) else root
         if not os.path.isdir(self.data_dir):
             raise FileNotFoundError(f'parquet data dir not found: {self.data_dir}')
@@ -184,18 +212,158 @@ class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
         self._total_rows = total_rows
 
     def __len__(self):
-        return self._total_rows
+        world_size = self._world_size()
+        if not self.batch_size:
+            return self._total_rows
+
+        if self.drop_last:
+            global_batch = self.batch_size * world_size
+            if global_batch <= 0:
+                return self._total_rows
+            full_batches = self._total_rows // global_batch
+            return full_batches * self.batch_size
+
+        return int(math.ceil(self._total_rows / float(world_size)))
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
 
-    def _assigned_row_groups(self):
+    def _world_size(self):
+        if self.distributed_world_size is not None:
+            return int(self.distributed_world_size)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            world_size = torch.distributed.get_world_size()
-            rank = torch.distributed.get_rank()
+            return torch.distributed.get_world_size()
+        return 1
+
+    def _rank(self):
+        if self.distributed_rank is not None:
+            return int(self.distributed_rank)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank()
+        return 0
+
+    def _ordered_row_group_indices(self):
+        indices = list(range(len(self._row_groups)))
+        if self.shuffle:
+            rng = pyrandom.Random(self.seed + self.epoch)
+            rng.shuffle(indices)
+        return indices
+
+    def _effective_total_rows(self, world_size):
+        if not self.batch_size:
+            return self._total_rows
+        if self.drop_last:
+            global_batch = self.batch_size * world_size
+            if global_batch <= 0:
+                return self._total_rows
+            return (self._total_rows // global_batch) * global_batch
+        return self._total_rows
+
+    def _partition_row_groups(self, ordered_indices, target_rows):
+        if target_rows <= 0:
+            return [[]]
+
+        partitions = []
+        current = []
+        remaining = int(target_rows)
+        for rg_global_idx in ordered_indices:
+            if remaining <= 0:
+                partitions.append(current)
+                current = []
+                remaining = int(target_rows)
+
+            path, rg_idx, rg_rows = self._row_groups[rg_global_idx]
+            start = 0
+            while rg_rows > 0:
+                if remaining <= 0:
+                    partitions.append(current)
+                    current = []
+                    remaining = int(target_rows)
+
+                take = min(rg_rows, remaining)
+                current.append((rg_global_idx, path, rg_idx, start, start + take))
+                rg_rows -= take
+                start += take
+                remaining -= take
+
+        if current:
+            partitions.append(current)
+        return partitions
+
+    def _rank_segments(self, world_size, rank):
+        ordered_indices = self._ordered_row_group_indices()
+        effective_total_rows = self._effective_total_rows(world_size)
+        if effective_total_rows <= 0:
+            return []
+
+        if self.batch_size and self.drop_last:
+            target_rows = effective_total_rows // world_size
         else:
-            world_size = 1
-            rank = 0
+            target_rows = int(math.ceil(effective_total_rows / float(world_size)))
+
+        partitions = self._partition_row_groups(ordered_indices, target_rows)
+        if rank >= len(partitions):
+            return []
+        return partitions[rank]
+
+    @staticmethod
+    def _partition_segments_for_worker(segments, num_workers, worker_id):
+        if num_workers <= 1 or not segments:
+            return segments
+
+        total_rows = sum(end - start for _, _, _, start, end in segments)
+        if total_rows <= 0:
+            return []
+
+        worker_target = int(math.ceil(total_rows / float(num_workers)))
+        worker_partitions = []
+        current = []
+        remaining = worker_target
+
+        for rg_global_idx, path, rg_idx, start, end in segments:
+            seg_start = start
+            seg_rows = end - start
+            while seg_rows > 0:
+                if remaining <= 0:
+                    worker_partitions.append(current)
+                    current = []
+                    remaining = worker_target
+
+                take = min(seg_rows, remaining)
+                current.append((rg_global_idx, path, rg_idx, seg_start, seg_start + take))
+                seg_rows -= take
+                seg_start += take
+                remaining -= take
+
+        if current:
+            worker_partitions.append(current)
+
+        if worker_id >= len(worker_partitions):
+            return []
+        return worker_partitions[worker_id]
+
+    def _iter_segment_rows(self, segment, rng):
+        rg_global_idx, path, rg_idx, start, end = segment
+        table = pq.ParquetFile(path).read_row_group(rg_idx, columns=['image', 'label'])
+        cols = table.to_pydict()
+        images = cols['image']
+        labels = cols['label']
+        order = list(range(start, end))
+        if self.shuffle:
+            rng.shuffle(order)
+
+        for idx in order:
+            image_bytes = images[idx]['bytes']
+            target = int(labels[idx])
+            image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+            if self.transform is not None:
+                image = self.transform(image)
+            yield image, target
+
+    def __iter__(self):
+        world_size = self._world_size()
+        rank = self._rank()
+        rank_segments = self._rank_segments(world_size, rank)
 
         info = torch.utils.data.get_worker_info()
         if info is None:
@@ -205,48 +373,42 @@ class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
             num_workers = info.num_workers
             worker_id = info.id
 
-        total_shards = world_size * num_workers
-        global_id = rank * num_workers + worker_id
+        worker_segments = self._partition_segments_for_worker(rank_segments, num_workers, worker_id)
+        rng = pyrandom.Random(self.seed + self.epoch * 1009 + rank * 53 + worker_id)
 
-        indices = list(range(len(self._row_groups)))
-        if self.shuffle:
-            rng = pyrandom.Random(self.seed + self.epoch)
-            rng.shuffle(indices)
-        return indices[global_id::total_shards], worker_id
-
-    def __iter__(self):
-        assigned, worker_id = self._assigned_row_groups()
-        rng = pyrandom.Random(self.seed + self.epoch * 1009 + worker_id)
-        handles = {}
-
-        for rg_global_idx in assigned:
-            path, rg_idx, _ = self._row_groups[rg_global_idx]
-            pf = handles.get(path)
-            if pf is None:
-                pf = pq.ParquetFile(path)
-                handles[path] = pf
-
-            table = pf.read_row_group(rg_idx, columns=['image', 'label'])
-            cols = table.to_pydict()
-            images = cols['image']
-            labels = cols['label']
-            order = list(range(len(images)))
-            if self.shuffle:
-                rng.shuffle(order)
-
-            for idx in order:
-                image_bytes = images[idx]['bytes']
-                target = int(labels[idx])
-                image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-                if self.transform is not None:
-                    image = self.transform(image)
-                yield image, target
+        for segment in worker_segments:
+            yield from self._iter_segment_rows(segment, rng)
 
 
-def create_dataset_compat(dataset_name, root, split, is_training, batch_size, repeats=0, transform=None):
+def create_dataset_compat(
+        dataset_name,
+        root,
+        split,
+        is_training,
+        batch_size,
+        repeats=0,
+        transform=None,
+        distributed=False,
+        distributed_world_size=None,
+        distributed_rank=None):
     if dataset_name == 'hf-parquet-imagenet':
+        # NOTE:
+        # For training we keep the high-throughput iterable parquet path, but we
+        # partition the globally shuffled row-group stream into equal full-batch
+        # sized chunks per rank. This preserves sequential row-group reads while
+        # guaranteeing every rank executes exactly the same number of training
+        # steps, avoiding the train/validate collective mismatch seen before.
         if is_training:
-            return ImageNetParquetIterableDataset(root=root, split=split, transform=transform, shuffle=True)
+            return ImageNetParquetIterableDataset(
+                root=root,
+                split=split,
+                transform=transform,
+                shuffle=True,
+                batch_size=batch_size,
+                drop_last=True,
+                distributed_world_size=distributed_world_size,
+                distributed_rank=distributed_rank,
+            )
         return ImageNetParquetDataset(root=root, split=split, transform=transform)
     return create_dataset(dataset_name, root=root, split=split, is_training=is_training,
                           batch_size=batch_size, repeats=repeats)
@@ -444,6 +606,8 @@ parser.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                     help='how many batches to wait before writing recovery checkpoint')
 parser.add_argument('--checkpoint-hist', type=int, default=10, metavar='N',
                     help='number of checkpoints to keep (default: 10)')
+parser.add_argument('--epoch-checkpoint-interval', type=int, default=10, metavar='N',
+                    help='save one epoch checkpoint every N epochs (default: 10)')
 parser.add_argument('-j', '--workers', type=int, default=4, metavar='N',
                     help='how many training processes to use (default: 1)')
 parser.add_argument('--save-images', action='store_true', default=False,
@@ -536,6 +700,24 @@ parser.add_argument('--quantized', action='store_true', default=False,
 parser.add_argument('--world_size', type=str, default='1', help='number of gpu to use for training')
 parser.add_argument('--visible_gpu', type=str, default='0', help='indicate which gpus to use for distributed training')
 parser.add_argument('--tcp_port', type=str, default='37879')
+parser.add_argument('--collect_attention', action='store_true', default=False,
+                    help='return attention matrices for offline probing')
+parser.add_argument('--max_train_updates', type=int, default=0,
+                    help='stop after this many optimizer updates in current run, 0 means no limit')
+parser.add_argument('--save_step_checkpoints', action='store_true', default=False,
+                    help='save step-level checkpoints during training updates')
+parser.add_argument('--save_initial_step_checkpoint', action='store_true', default=False,
+                    help='save step checkpoint before any new optimizer update')
+parser.add_argument('--step_checkpoint_interval', type=int, default=1,
+                    help='save one step checkpoint every N optimizer updates')
+parser.add_argument('--step_checkpoint_warmup_updates', type=int, default=0,
+                    help='run this many optimizer updates before starting step checkpoint collection')
+parser.add_argument('--max_step_checkpoints_to_save', type=int, default=0,
+                    help='maximum number of step checkpoints to save after warmup, 0 means no limit')
+parser.add_argument('--skip_validate', action='store_true', default=False,
+                    help='skip validation pass for quick replay runs')
+parser.add_argument('--eval-only', action='store_true', default=False,
+                    help='load checkpoint, run validation once, and exit without further training')
 
 parser.add_argument('--apply_q_attn_dropout', type= int, default= 0
                     ,help="0: quantized attn and apply dropout, 1 don't q attn and apply dropout, 2 don't q attn and don't dropout, 3 quantized attn but no dropout")
@@ -607,6 +789,89 @@ def get_qat_model(model, args):
         qk_reparam=args.qk_reparam, qk_reparam_type = args.qk_reparam_type)
     
     return qat_model
+
+
+def enable_attention_collection(model):
+    enabled = 0
+    for module in model.modules():
+        module_name = type(module).__name__
+        if module_name == 'ShiftedWindowAttention' or module_name.startswith('QAttention_swin'):
+            setattr(module, 'collect_attention', True)
+            enabled += 1
+    return enabled
+
+
+def _write_sync_marker(path):
+    with open(path, 'w') as sync_f:
+        sync_f.write('1')
+
+
+def _wait_for_sync_markers(paths, timeout_seconds, poll_interval=1.0):
+    deadline = time.monotonic() + timeout_seconds
+    pending = set(paths)
+    while pending:
+        ready = {path for path in pending if os.path.exists(path)}
+        pending.difference_update(ready)
+        if not pending:
+            return
+        if time.monotonic() > deadline:
+            raise RuntimeError(f'Timed out waiting for sync markers: {sorted(pending)}')
+        time.sleep(poll_interval)
+
+
+def _cleanup_sync_markers(paths):
+    for path in paths:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def _save_epoch_checkpoint_no_metric(saver, epoch):
+    if saver is None:
+        raise RuntimeError('Checkpoint save requested on rank 0 but saver is not initialized.')
+
+    tmp_save_path = os.path.join(saver.checkpoint_dir, 'tmp' + saver.extension)
+    last_save_path = os.path.join(saver.checkpoint_dir, 'last' + saver.extension)
+    checkpoint_name = '-'.join([saver.save_prefix, str(epoch)]) + saver.extension
+    checkpoint_path = os.path.join(saver.checkpoint_dir, checkpoint_name)
+
+    saver._save(tmp_save_path, epoch, metric=None)
+    if os.path.exists(last_save_path):
+        os.unlink(last_save_path)
+    os.replace(tmp_save_path, last_save_path)
+
+    if os.path.exists(checkpoint_path):
+        os.unlink(checkpoint_path)
+    shutil.copy2(last_save_path, checkpoint_path)
+
+    saver.checkpoint_files = [
+        (path, metric) for path, metric in saver.checkpoint_files
+        if os.path.exists(path) and path != checkpoint_path
+    ]
+    saver.checkpoint_files.append((checkpoint_path, None))
+    _logger.info(f'Saved checkpoint artifacts without eval metric: {checkpoint_path}')
+    return None, None
+
+
+def save_step_checkpoint(model, optimizer, args, output_dir, step_tag, epoch=None, batch_idx=None, loss_scaler=None, metric=None):
+    step_dir = os.path.join(output_dir, 'step_checkpoints')
+    os.makedirs(step_dir, exist_ok=True)
+    save_state = {
+        'epoch': epoch,
+        'batch_idx': batch_idx,
+        'arch': args.model,
+        'state_dict': get_state_dict(model),
+        'optimizer': optimizer.state_dict(),
+        'version': 2,
+        'args': args,
+        'step_tag': step_tag,
+    }
+    if loss_scaler is not None:
+        save_state[loss_scaler.state_dict_key] = loss_scaler.state_dict()
+    if metric is not None:
+        save_state['metric'] = metric
+    save_path = os.path.join(step_dir, f'{step_tag}.pth.tar')
+    torch.save(save_state, save_path)
+    return save_path
 
 def create_teacher_model(args):
     if args.teacher_type == "deit":
@@ -694,6 +959,11 @@ def main(local_rank, args):
 
     if args.quantized:
         model = get_qat_model(model, args)
+
+    if args.collect_attention:
+        enabled_attention_modules = enable_attention_collection(model)
+        if args.local_rank == 0:
+            _logger.info(f'Enabled attention collection for {enabled_attention_modules} modules.')
     
     if args.initial_checkpoint != "":
         load_checkpoint(model, args.initial_checkpoint, strict=False)
@@ -757,7 +1027,11 @@ def main(local_rank, args):
     dataset_train = create_dataset_compat(
         args.dataset,
         root=args.data_dir, split=args.train_split, is_training=True,
-        batch_size=args.batch_size, repeats=args.epoch_repeats)
+        batch_size=args.batch_size,
+        repeats=args.epoch_repeats,
+        distributed=args.distributed,
+        distributed_world_size=args.world_size,
+        distributed_rank=args.rank)
 
     # setup mixup / cutmix
     collate_fn = None
@@ -815,7 +1089,11 @@ def main(local_rank, args):
         _logger.info(f"Trainer transform: {loader_train.dataset.transform}")
         
     dataset_eval = create_dataset_compat(
-        args.dataset, root=args.data_dir, split=args.val_split, is_training=False, batch_size=args.batch_size)
+        args.dataset, root=args.data_dir, split=args.val_split, is_training=False,
+        batch_size=args.batch_size,
+        distributed=args.distributed,
+        distributed_world_size=args.world_size,
+        distributed_rank=args.rank)
 
     loader_eval = create_loader_compat(
         dataset_eval,
@@ -831,16 +1109,14 @@ def main(local_rank, args):
         crop_pct=data_config['crop_pct'],
         pin_memory=args.pin_mem,
     )        
-    print(dataset_train.__len__())
-    print(dataset_eval.__len__())
+    if args.local_rank == 0:
+        print(dataset_train.__len__())
+        print(dataset_eval.__len__())
 
     
 
     ## have to create and init all the parameters before send to optimizer (important!)
     setup_alpha(model=model,loader=loader_train,args=args)
-    if args.local_rank == 0:
-        _logger.info(f"Model {model}")
-
     # when creating optimizer, only weights and emb have weight-decay
     optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
 
@@ -910,6 +1186,23 @@ def main(local_rank, args):
             model = NativeDDP(model, device_ids=[args.local_rank])  # can use device str in Torch >= 1.1
         # NOTE: EMA model does not need to be wrapped by DDP
 
+    if (
+        resume_epoch is not None
+        and args.start_epoch is None
+        and getattr(args, 'save_step_checkpoints', False)
+        and int(getattr(args, 'max_train_updates', 0)) > 0
+        and int(getattr(args, 'epochs', 0)) <= int(resume_epoch)
+    ):
+        adjusted_epochs = int(resume_epoch) + 1
+        if args.local_rank == 0:
+            _logger.info(
+                'Adjusted args.epochs from %s to %s so resumed replay training can advance past epoch %s.',
+                args.epochs,
+                adjusted_epochs,
+                resume_epoch,
+            )
+        args.epochs = adjusted_epochs
+
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
     start_epoch = 0
@@ -960,10 +1253,20 @@ def main(local_rank, args):
     
 
     if args.resume:
-        validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast,model_type=args.model_type)
+        if not args.skip_validate or args.eval_only:
+            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast,model_type=args.model_type)
+            if args.eval_only:
+                if args.local_rank == 0:
+                    _logger.info('Eval-only metrics: {}'.format(eval_metrics))
+                return
     elif args.experiment:
         if os.path.exists(os.path.join(output_dir_resume,'last.pth.tar')):
-            validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast,model_type=args.model_type)
+            if not args.skip_validate or args.eval_only:
+                eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast,model_type=args.model_type)
+                if args.eval_only:
+                    if args.local_rank == 0:
+                        _logger.info('Eval-only metrics: {}'.format(eval_metrics))
+                    return
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
@@ -990,6 +1293,19 @@ def main(local_rank, args):
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
+        if args.save_step_checkpoints and args.save_initial_step_checkpoint and int(getattr(args, 'step_checkpoint_warmup_updates', 0)) == 0:
+            initial_step_path = save_step_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                args=args,
+                output_dir=output_dir,
+                step_tag='step_0000',
+                epoch=start_epoch,
+                batch_idx=-1,
+                loss_scaler=loss_scaler,
+            )
+            _logger.info(f'Saved initial step checkpoint to {initial_step_path}')
+
     try:
             
         for epoch in range(start_epoch, num_epochs):
@@ -998,21 +1314,24 @@ def main(local_rank, args):
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
 
-            train_metrics = train_one_epoch(
+            train_metrics, local_update_count, stopped_early = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema,
                 mixup_fn=mixup_fn, teacher=teacher,teacher_type=args.teacher_type, log_wandb=args.log_wandb and has_wandb )
-            print("epoch: ", epoch, "g['lr']: ",optimizer.param_groups[0]['lr'])
+            if args.local_rank == 0:
+                print("epoch: ", epoch, "g['lr']: ",optimizer.param_groups[0]['lr'])
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if args.local_rank == 0:
                     _logger.info("Distributing BatchNorm running means and vars")
                 distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
-            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast,epoch=epoch, log_wandb=args.log_wandb and has_wandb)
+            eval_metrics = {'loss': None, eval_metric: None}
+            if not args.skip_validate:
+                eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast,epoch=epoch, log_wandb=args.log_wandb and has_wandb)
                 
-            if model_ema is not None and not args.model_ema_force_cpu:
+            if not args.skip_validate and model_ema is not None and not args.model_ema_force_cpu:
                 if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                     distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
                 ema_eval_metrics = validate(
@@ -1022,17 +1341,84 @@ def main(local_rank, args):
 
             if lr_scheduler is not None:
                 # step LR for next epoch
-                lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
+                if args.skip_validate:
+                    lr_scheduler.step(epoch + 1)
+                else:
+                    lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
 
-            if output_dir is not None:
+            if output_dir is not None and not args.skip_validate:
                 update_summary(
                     epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
                     write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
 
-            if saver is not None:
-                # save proper checkpoint with eval metric
-                save_metric = eval_metrics[eval_metric]
-                best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
+            # save proper checkpoint with eval metric when available; otherwise still
+            # persist a last/checkpoint-N artifact for later eval-only validation.
+            save_metric = None if args.skip_validate else eval_metrics[eval_metric]
+            should_save_checkpoint = (
+                ((epoch + 1) % max(1, int(getattr(args, 'epoch_checkpoint_interval', 10))) == 0)
+                or ((epoch + 1) == num_epochs)
+                or stopped_early
+            )
+            if should_save_checkpoint:
+                save_sync_path = None
+                sync_output_dir = output_dir if output_dir is not None else output_dir_resume
+                dist_ready = (
+                    args.distributed
+                    and torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                )
+                sync_timeout_seconds = 1800
+                ready_markers = []
+                ack_markers = []
+                cleanup_marker_path = None
+                rank_ready_path = None
+                rank_ack_path = None
+                distributed_world_size = int(args.world_size)
+                if dist_ready and sync_output_dir is not None:
+                    save_sync_path = os.path.join(sync_output_dir, f'.checkpoint_sync_epoch_{epoch}.done')
+                    cleanup_marker_path = os.path.join(sync_output_dir, f'.checkpoint_sync_epoch_{epoch}.cleanup')
+                    ready_markers = [
+                        os.path.join(sync_output_dir, f'.checkpoint_sync_epoch_{epoch}.rank{rank}.ready')
+                        for rank in range(distributed_world_size)
+                    ]
+                    ack_markers = [
+                        os.path.join(sync_output_dir, f'.checkpoint_sync_epoch_{epoch}.rank{rank}.ack')
+                        for rank in range(distributed_world_size)
+                    ]
+                    rank_ready_path = ready_markers[args.rank]
+                    rank_ack_path = ack_markers[args.rank]
+                    if args.rank == 0:
+                        _cleanup_sync_markers([cleanup_marker_path, save_sync_path, *ready_markers, *ack_markers])
+                        _write_sync_marker(cleanup_marker_path)
+                    else:
+                        _wait_for_sync_markers([cleanup_marker_path], sync_timeout_seconds)
+                    _write_sync_marker(rank_ready_path)
+                    if args.rank == 0:
+                        _wait_for_sync_markers(ready_markers, sync_timeout_seconds)
+
+                if args.rank == 0:
+                    if save_metric is None:
+                        best_metric, best_epoch = _save_epoch_checkpoint_no_metric(saver, epoch)
+                    else:
+                        if saver is None:
+                            raise RuntimeError('Checkpoint save requested on rank 0 but saver is not initialized.')
+                        best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
+                    if save_sync_path is not None:
+                        _write_sync_marker(save_sync_path)
+                        _logger.info(f'Checkpoint sync marker written for epoch {epoch}: {save_sync_path}')
+                elif save_sync_path is not None:
+                    _wait_for_sync_markers([save_sync_path], sync_timeout_seconds)
+
+                if dist_ready and rank_ack_path is not None:
+                    _write_sync_marker(rank_ack_path)
+                    if args.rank == 0:
+                        _wait_for_sync_markers(ack_markers, sync_timeout_seconds)
+                        _cleanup_sync_markers([cleanup_marker_path, save_sync_path, *ready_markers, *ack_markers])
+
+            if stopped_early:
+                if args.local_rank == 0:
+                    _logger.info(f'Stopped early after {local_update_count} optimizer updates in epoch {epoch}.')
+                break
 
     except KeyboardInterrupt:
         pass
@@ -1041,6 +1427,12 @@ def main(local_rank, args):
 
     if args.log_wandb and has_wandb:
         wandb.finish()
+
+    if args.distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            torch.distributed.destroy_process_group()
+        except Exception:
+            pass
 
 def train_one_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
@@ -1065,6 +1457,11 @@ def train_one_epoch(
     end = time.time()
     last_idx = len(loader) - 1
     num_updates = epoch * len(loader)
+    local_update_count = 0
+    saved_step_count = 0
+    stopped_early = False
+    warmup_updates = max(0, int(getattr(args, 'step_checkpoint_warmup_updates', 0)))
+    max_step_checkpoints_to_save = max(0, int(getattr(args, 'max_step_checkpoints_to_save', 0)))
     for batch_idx, (input, target) in enumerate(loader):
         last_batch = batch_idx == last_idx
         update_step = ((batch_idx + 1) % accum_steps == 0) or last_batch
@@ -1076,56 +1473,113 @@ def train_one_epoch(
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
-        with amp_autocast(): 
-            if args.model_type == 'deit' or args.model_type == 'swin':
-                student_logit, student_attn_info = model(input)
-            else: 
-                student_logit = model(input)
-            if args.use_kd:
-                    
-                if args.kd_hard_and_soft == 0:
-                    if args.teacher_type == 'deit':
-                        soft_target, _ = teacher(input)
-                    else: 
-                        soft_target = teacher(input)
-                    loss = loss_fn(student_logit, soft_target)
-                elif args.kd_hard_and_soft == 1:
-                    if args.teacher_type == 'deit' or args.teacher_type == 'swin':
-                        soft_target, teacher_attn_info = teacher(input)
-                    else:
-                        soft_target = teacher(input)
-                        
-                    loss = loss_fn(student_logit, target, soft_target)
-                    
+        ddp_sync_context = nullcontext()
+        if args.distributed and not update_step and hasattr(model, 'no_sync'):
+            ddp_sync_context = model.no_sync()
+
+        with ddp_sync_context:
+            with amp_autocast():
+                if args.model_type == 'deit' or args.model_type == 'swin':
+                    student_logit, student_attn_info = model(input)
+                else:
+                    student_logit = model(input)
+                if args.use_kd:
+                    if args.kd_hard_and_soft == 0:
+                        if args.teacher_type == 'deit':
+                            soft_target, _ = teacher(input)
+                        else:
+                            soft_target = teacher(input)
+                        loss = loss_fn(student_logit, soft_target)
+                    elif args.kd_hard_and_soft == 1:
+                        if args.teacher_type == 'deit' or args.teacher_type == 'swin':
+                            soft_target, teacher_attn_info = teacher(input)
+                        else:
+                            soft_target = teacher(input)
+
+                        loss = loss_fn(student_logit, target, soft_target)
+                else:
+                    student_logit = student_logit[0] if isinstance(student_logit, tuple) else student_logit
+                    loss = loss_fn(student_logit, target)
+
+            loss_for_log = loss.detach()
+
+            if not args.distributed:
+                losses_m.update(loss_for_log.item(), input.size(0))
+
+            loss = loss / accum_steps
+            if loss_scaler is not None:
+                loss_scaler(
+                    loss, optimizer,
+                    clip_grad=args.clip_grad, clip_mode=args.clip_mode,
+                    parameters=model_parameters(model, exclude_head='agc' in args.clip_mode),
+                    create_graph=second_order,
+                    update_grad=update_step)
             else:
-                student_logit = student_logit[0] if isinstance(student_logit, tuple) else student_logit
-                loss = loss_fn(student_logit, target)
+                loss.backward(create_graph=second_order)
 
-        loss_for_log = loss.detach()
-
-        if not args.distributed:
-            losses_m.update(loss_for_log.item(), input.size(0))
-
-        loss = loss / accum_steps
-        if loss_scaler is not None:
-            loss_scaler(
-                loss, optimizer,
-                clip_grad=args.clip_grad, clip_mode=args.clip_mode,
-                parameters=model_parameters(model, exclude_head='agc' in args.clip_mode),
-                create_graph=second_order,
-                update_grad=update_step)
-        else:
-            loss.backward(create_graph=second_order)
-
-            if update_step:
-                if args.clip_grad is not None:
-                    dispatch_clip_grad(
-                        model_parameters(model, exclude_head='agc' in args.clip_mode),
-                        value=args.clip_grad, mode=args.clip_mode)
-                optimizer.step()
+                if update_step:
+                    if args.clip_grad is not None:
+                        dispatch_clip_grad(
+                            model_parameters(model, exclude_head='agc' in args.clip_mode),
+                            value=args.clip_grad, mode=args.clip_mode)
+                    optimizer.step()
 
         if update_step:
             optimizer.zero_grad()
+            local_update_count += 1
+
+            if args.rank == 0 and args.save_step_checkpoints and output_dir is not None:
+                interval = max(1, int(args.step_checkpoint_interval))
+                if warmup_updates > 0:
+                    if args.save_initial_step_checkpoint and local_update_count == warmup_updates:
+                        save_path = save_step_checkpoint(
+                            model=model,
+                            optimizer=optimizer,
+                            args=args,
+                            output_dir=output_dir,
+                            step_tag=f'step_{saved_step_count:04d}',
+                            epoch=epoch,
+                            batch_idx=batch_idx,
+                            loss_scaler=loss_scaler,
+                        )
+                        saved_step_count += 1
+                        _logger.info(f'Saved warmup-complete step checkpoint to {save_path}')
+
+                    if local_update_count > warmup_updates and (local_update_count - warmup_updates) % interval == 0:
+                        if max_step_checkpoints_to_save == 0 or saved_step_count < max_step_checkpoints_to_save:
+                            save_path = save_step_checkpoint(
+                                model=model,
+                                optimizer=optimizer,
+                                args=args,
+                                output_dir=output_dir,
+                                step_tag=f'step_{saved_step_count:04d}',
+                                epoch=epoch,
+                                batch_idx=batch_idx,
+                                loss_scaler=loss_scaler,
+                            )
+                            saved_step_count += 1
+                            _logger.info(f'Saved step checkpoint to {save_path}')
+
+                    if max_step_checkpoints_to_save > 0 and saved_step_count >= max_step_checkpoints_to_save:
+                        stopped_early = True
+                        if args.local_rank == 0:
+                            _logger.info(
+                                f'Stopped after saving {saved_step_count} step checkpoints '
+                                f'following {warmup_updates} warmup updates.'
+                            )
+                        break
+                elif local_update_count % interval == 0:
+                    save_path = save_step_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        args=args,
+                        output_dir=output_dir,
+                        step_tag=f'step_{local_update_count:04d}',
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        loss_scaler=loss_scaler,
+                    )
+                    _logger.info(f'Saved step checkpoint to {save_path}')
 
 
         if args.local_rank == 0 and args.log_wandb and has_wandb and batch_idx == 0 and epoch == 0:
@@ -1143,6 +1597,12 @@ def train_one_epoch(
         if last_batch or batch_idx % args.log_interval == 0:
             lrl = [param_group['lr'] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
+            remaining_batches_in_epoch = max(last_idx - batch_idx, 0)
+            remaining_epochs = max(int(getattr(args, 'epochs', epoch + 1)) - epoch - 1, 0)
+            remaining_batches_total = remaining_batches_in_epoch + remaining_epochs * len(loader)
+            eta_seconds = batch_time_m.avg * remaining_batches_total
+            eta_duration = format_eta_duration(eta_seconds)
+            eta_finish_time = (datetime.now() + timedelta(seconds=eta_seconds)).strftime('%Y-%m-%d %H:%M:%S')
 
             if args.distributed:
                 reduced_loss = reduce_tensor(loss.data, args.world_size)
@@ -1157,6 +1617,8 @@ def train_one_epoch(
                     'Loss: {loss.val:>9.6f} ({loss.avg:>6.4f})  '
                     'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s  '
                     '({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
+                    'ETA: {eta_duration}  '
+                    'Done: {eta_finish_time}  '
                     'LR: {lr:.3e}  '
                     'Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
                         epoch,
@@ -1166,6 +1628,8 @@ def train_one_epoch(
                         batch_time=batch_time_m,
                         rate=input.size(0) * args.world_size / batch_time_m.val,
                         rate_avg=input.size(0) * args.world_size / batch_time_m.avg,
+                        eta_duration=eta_duration,
+                        eta_finish_time=eta_finish_time,
                         lr=lr,
                         data_time=data_time_m))
 
@@ -1183,16 +1647,21 @@ def train_one_epoch(
         if lr_scheduler is not None and update_step:
             lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
 
+        if args.max_train_updates and local_update_count >= args.max_train_updates:
+            stopped_early = True
+            break
+
         end = time.time()
 
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
 
-    return OrderedDict([('loss', losses_m.avg)])
+    return OrderedDict([('loss', losses_m.avg)]), local_update_count, stopped_early
 
 def setup_alpha(model, loader, args, amp_autocast=suppress):
     model.eval()
-    print("setup alpha")
+    if getattr(args, 'local_rank', 0) == 0:
+        print("setup alpha")
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(loader):
             if not args.prefetcher:
@@ -1212,7 +1681,8 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='',
     top5_m = AverageMeter()
 
     model.eval()
-    print("model eval")
+    if getattr(args, 'local_rank', 0) == 0:
+        print("model eval")
     end = time.time()
     last_idx = len(loader) - 1
     with torch.no_grad():
@@ -1281,9 +1751,10 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='',
 if __name__ == '__main__':
     args, args_text = parse_args()
     
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.visible_gpu
+    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.visible_gpu
     os.environ['WORLD_SIZE'] = args.world_size
-    os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+    os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "OFF")
     # os.environ["TORCH_CPP_LOG_LEVEL"]="INFO"
 
     mp.spawn( main,
