@@ -729,6 +729,18 @@ parser.add_argument('--pretrained_initialized', action='store_true', default=Fal
 ## apply qk_reparam
 parser.add_argument( '--qk_reparam', action='store_true', default= False, help="True: use QKR, False: doesn't use QKR")
 parser.add_argument( '--qk_reparam_type', type=int, default=0, help="0 for normal training, 1 if for cga finetuning")
+parser.add_argument('--train-scheme', type=str, default='baseline',
+                    help='training scheme name, baseline keeps original behavior')
+parser.add_argument('--ref-update', type=str, default='ema',
+                    help='historical reference model update type')
+parser.add_argument('--ref-momentum', type=float, default=0.999,
+                    help='EMA momentum for historical reference model')
+parser.add_argument('--ref-attn-kl-weight', type=float, default=0.0,
+                    help='attention KL consistency weight against EMA refmodel')
+parser.add_argument('--ref-head-mode', type=str, default='all',
+                    help='head-level refmodel development hook, current supported value is all')
+parser.add_argument('--ref-warmup-epochs', type=int, default=0,
+                    help='epochs to wait before enabling EMA refmodel attention KL')
 
 
 def parse_args():

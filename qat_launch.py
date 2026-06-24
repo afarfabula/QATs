@@ -22,6 +22,8 @@ import pyarrow.parquet as pq
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.serialization
 import yaml
 from PIL import Image
 from timm.data import AugMixDataset, FastCollateMixup, Mixup, create_dataset, create_loader, resolve_data_config
@@ -35,12 +37,16 @@ THIRD_PARTY = ROOT / "third_party"
 OFQ_ROOT = THIRD_PARTY / "OFQ"
 _OFQ_TRAIN_MODULE = None
 
+if hasattr(torch.serialization, "add_safe_globals"):
+    torch.serialization.add_safe_globals([argparse.Namespace, SimpleNamespace])
+
 
 class ImageNetParquetDataset(torch.utils.data.Dataset):
-    def __init__(self, root: str, split: str = "train", transform=None):
+    def __init__(self, root: str, split: str = "train", transform=None, subset_ratio: float = 1.0):
         self.root = root
         self.split = split
         self.transform = transform
+        self.subset_ratio = float(subset_ratio)
         self.data_dir = os.path.join(root, "data") if os.path.isdir(os.path.join(root, "data")) else root
         if not os.path.isdir(self.data_dir):
             raise FileNotFoundError(f"parquet data dir not found: {self.data_dir}")
@@ -67,6 +73,24 @@ class ImageNetParquetDataset(torch.utils.data.Dataset):
             total_rows += file_total
         self._total_rows = total_rows
         self._file_handles = {}
+        self._apply_subset_ratio()
+
+    def _apply_subset_ratio(self) -> None:
+        if self.subset_ratio <= 0 or self.subset_ratio > 1:
+            raise ValueError(f"subset_ratio must be in (0, 1], got {self.subset_ratio}")
+        if self.subset_ratio >= 1:
+            return
+
+        target_rows = max(1, int(math.ceil(self._total_rows * self.subset_ratio)))
+        subset_row_groups = []
+        subset_total_rows = 0
+        for _, file_idx, rg_idx, rg_rows in self._row_groups:
+            if subset_total_rows >= target_rows:
+                break
+            subset_row_groups.append((subset_total_rows, file_idx, rg_idx, rg_rows))
+            subset_total_rows += rg_rows
+        self._row_groups = subset_row_groups
+        self._total_rows = min(subset_total_rows, target_rows)
 
     def __len__(self):
         return self._total_rows
@@ -93,7 +117,7 @@ class ImageNetParquetDataset(torch.utils.data.Dataset):
 
 
 class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
-    def __init__(self, root: str, split: str = "train", transform=None, shuffle: bool = True, seed: int = 42):
+    def __init__(self, root: str, split: str = "train", transform=None, shuffle: bool = True, seed: int = 42, subset_ratio: float = 1.0):
         super().__init__()
         self.root = root
         self.split = split
@@ -101,6 +125,7 @@ class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
         self.shuffle = shuffle
         self.seed = seed
         self.epoch = 0
+        self.subset_ratio = float(subset_ratio)
         self.data_dir = os.path.join(root, "data") if os.path.isdir(os.path.join(root, "data")) else root
         if not os.path.isdir(self.data_dir):
             raise FileNotFoundError(f"parquet data dir not found: {self.data_dir}")
@@ -122,12 +147,27 @@ class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
                 self._row_groups.append((path, rg_idx, rg_rows))
                 total_rows += rg_rows
         self._total_rows = total_rows
+        self._apply_subset_ratio()
+
+    def _apply_subset_ratio(self) -> None:
+        if self.subset_ratio <= 0 or self.subset_ratio > 1:
+            raise ValueError(f"subset_ratio must be in (0, 1], got {self.subset_ratio}")
+        if self.subset_ratio >= 1:
+            return
+
+        target_rows = max(1, int(math.ceil(self._total_rows * self.subset_ratio)))
+        subset_row_groups = []
+        subset_total_rows = 0
+        for path, rg_idx, rg_rows in self._row_groups:
+            if subset_total_rows >= target_rows:
+                break
+            subset_row_groups.append((path, rg_idx, rg_rows))
+            subset_total_rows += rg_rows
+        self._row_groups = subset_row_groups
+        self._total_rows = min(subset_total_rows, target_rows)
 
     def __len__(self):
-        rank, world_size = self._distributed_context()
-        if world_size <= 1:
-            return self._total_rows
-        return sum(self._row_groups[idx][2] for idx in range(rank, len(self._row_groups), world_size))
+        return self._target_samples_per_rank()
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -139,6 +179,14 @@ class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
         rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         return rank, world_size
+
+    def _target_samples_per_rank(self) -> int:
+        _, world_size = self._distributed_context()
+        if world_size <= 1:
+            return self._total_rows
+        # Match DistributedSampler semantics: equal per-rank sample counts, with
+        # minimal duplication when the dataset size is not divisible by world size.
+        return int(math.ceil(self._total_rows / world_size))
 
     def _assigned_row_groups(self):
         rank, world_size = self._distributed_context()
@@ -155,15 +203,32 @@ class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
             rng.shuffle(indices)
 
         rank_indices = indices[rank::world_size]
-        return rank_indices[worker_id::num_workers], worker_id
+        worker_indices = rank_indices[worker_id::num_workers]
+        if not worker_indices and rank_indices:
+            worker_indices = [rank_indices[worker_id % len(rank_indices)]]
+        return worker_indices, worker_id
 
     def __iter__(self):
         assigned, worker_id = self._assigned_row_groups()
         import random as pyrandom
 
+        if not assigned:
+            return
+
         rng = pyrandom.Random(self.seed + self.epoch * 1009 + worker_id)
+        info = torch.utils.data.get_worker_info()
+        num_workers = 1 if info is None else info.num_workers
+        target_samples = self._target_samples_per_rank()
+        worker_target = target_samples // num_workers
+        if worker_id < (target_samples % num_workers):
+            worker_target += 1
+
         handles = {}
-        for rg_global_idx in assigned:
+        yielded = 0
+        cycle_idx = 0
+        while yielded < worker_target:
+            rg_global_idx = assigned[cycle_idx % len(assigned)]
+            cycle_idx += 1
             path, rg_idx, _ = self._row_groups[rg_global_idx]
             pf = handles.get(path)
             if pf is None:
@@ -182,6 +247,9 @@ class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
                 if self.transform is not None:
                     image = self.transform(image)
                 yield image, target
+                yielded += 1
+                if yielded >= worker_target:
+                    break
 
 
 def str2bool(value: str | bool) -> bool:
@@ -399,9 +467,16 @@ def build_ofq(args: argparse.Namespace) -> Tuple[List[str], Path, Dict[str, str]
     append_optional_flag(command, "--use-kd", args.use_kd)
     append_optional_value(command, "--kd_hard_and_soft", args.kd_hard_and_soft)
     append_optional_flag(command, "--teacher_pretrained", args.teacher_pretrained)
+    append_optional_value(command, "--teacher-checkpoint", normalize_path(args.teacher_checkpoint))
     append_optional_flag(command, "--quantized", args.quantized)
     append_optional_flag(command, "--qk_reparam", args.qk_reparam)
     append_optional_value(command, "--qk_reparam_type", args.qk_reparam_type)
+    append_optional_value(command, "--train-scheme", args.train_scheme)
+    append_optional_value(command, "--ref-update", args.ref_update)
+    append_optional_value(command, "--ref-momentum", args.ref_momentum)
+    append_optional_value(command, "--ref-attn-kl-weight", args.ref_attn_kl_weight)
+    append_optional_value(command, "--ref-head-mode", args.ref_head_mode)
+    append_optional_value(command, "--ref-warmup-epochs", args.ref_warmup_epochs)
 
     command.extend(args.extra_arg)
     return command, repo, env
@@ -495,11 +570,11 @@ def load_ofq_training_module():
     return _OFQ_TRAIN_MODULE
 
 
-def create_dataset_compat(dataset_name, root, split, is_training, batch_size, repeats=0, transform=None):
+def create_dataset_compat(dataset_name, root, split, is_training, batch_size, repeats=0, transform=None, subset_ratio: float = 1.0):
     if dataset_name == "hf-parquet-imagenet":
         if is_training:
-            return ImageNetParquetIterableDataset(root=root, split=split, transform=transform, shuffle=True)
-        return ImageNetParquetDataset(root=root, split=split, transform=transform)
+            return ImageNetParquetIterableDataset(root=root, split=split, transform=transform, shuffle=True, subset_ratio=subset_ratio)
+        return ImageNetParquetDataset(root=root, split=split, transform=transform, subset_ratio=subset_ratio)
     return create_dataset(dataset_name, root=root, split=split, is_training=is_training, batch_size=batch_size, repeats=repeats)
 
 
@@ -512,6 +587,7 @@ def create_loader_compat(dataset, **kwargs):
 def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--skip_validate", action="store_true")
+    parser.add_argument("--eval-only", dest="eval_only", action="store_true")
     parser.add_argument("--max_train_updates", type=int)
     parser.add_argument("--log-interval", dest="log_interval", type=int)
     parser.add_argument("--save_step_checkpoints", action="store_true")
@@ -545,6 +621,7 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--recovery-interval", dest="recovery_interval", type=int)
     parser.add_argument("--checkpoint-hist", dest="checkpoint_hist", type=int)
     parser.add_argument("--epoch-checkpoint-interval", dest="epoch_checkpoint_interval", type=int)
+    parser.add_argument("--subset-ratio", dest="subset_ratio", type=float)
     parser.add_argument("--initial_checkpoint", dest="initial_checkpoint_alias", type=str)
     namespace, _ = parser.parse_known_args(list(extra_args))
     overrides = {k: v for k, v in vars(namespace).items() if v is not None and v is not False}
@@ -594,6 +671,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "recovery_interval": 0,
         "checkpoint_hist": 10,
         "epoch_checkpoint_interval": 10,
+        "subset_ratio": 1.0,
         "save_images": False,
         "amp": False,
         "apex_amp": False,
@@ -643,6 +721,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "step_checkpoint_warmup_updates": 0,
         "max_step_checkpoints_to_save": 0,
         "skip_validate": False,
+        "eval_only": False,
         "apply_q_attn_dropout": 0,
         "act_layer": "gelu",
         "kd_hard_and_soft": 1,
@@ -650,6 +729,12 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "pretrained_initialized": False,
         "qk_reparam": False,
         "qk_reparam_type": 0,
+        "train_scheme": "baseline",
+        "ref_update": "ema",
+        "ref_momentum": 0.999,
+        "ref_attn_kl_weight": 0.0,
+        "ref_head_mode": "all",
+        "ref_warmup_epochs": 0,
         "initial_checkpoint": "",
         "resume": "",
         "no_resume_opt": False,
@@ -738,8 +823,22 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     if args.use_kd and defaults.get("kd_hard_and_soft", 0) == 0:
         defaults["kd_hard_and_soft"] = 1
     defaults["teacher_pretrained"] = bool(args.teacher_pretrained or defaults.get("teacher_pretrained", False))
+    if args.teacher_checkpoint is not None:
+        defaults["teacher_checkpoint"] = args.teacher_checkpoint
     defaults["quantized"] = bool(args.quantized or defaults.get("quantized", False))
     defaults["qk_reparam"] = bool(args.qk_reparam or defaults.get("qk_reparam", False))
+    if args.train_scheme is not None:
+        defaults["train_scheme"] = args.train_scheme
+    if args.ref_update is not None:
+        defaults["ref_update"] = args.ref_update
+    if args.ref_momentum is not None:
+        defaults["ref_momentum"] = args.ref_momentum
+    if args.ref_attn_kl_weight is not None:
+        defaults["ref_attn_kl_weight"] = args.ref_attn_kl_weight
+    if args.ref_head_mode is not None:
+        defaults["ref_head_mode"] = args.ref_head_mode
+    if args.ref_warmup_epochs is not None:
+        defaults["ref_warmup_epochs"] = args.ref_warmup_epochs
 
     defaults.update(build_ofq_runtime_overrides(args.extra_arg))
     defaults["world_size"] = int(defaults["world_size"])
@@ -754,6 +853,10 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["warmup_epochs"] = int(defaults["warmup_epochs"])
     defaults["num_classes"] = int(defaults["num_classes"])
     defaults["epoch_checkpoint_interval"] = int(defaults["epoch_checkpoint_interval"])
+    defaults["subset_ratio"] = float(defaults["subset_ratio"])
+    defaults["ref_warmup_epochs"] = int(defaults["ref_warmup_epochs"])
+    defaults["ref_momentum"] = float(defaults["ref_momentum"])
+    defaults["ref_attn_kl_weight"] = float(defaults["ref_attn_kl_weight"])
     defaults["no_prefetcher"] = bool(defaults.get("no_prefetcher", False))
     defaults["prefetcher"] = not defaults["no_prefetcher"]
     defaults["teacher"] = defaults["teacher"] or defaults["model"]
@@ -844,7 +947,7 @@ def create_ofq_teacher_model(runtime_args: SimpleNamespace) -> nn.Module:
         teacher = create_model(runtime_args.teacher, num_classes=runtime_args.num_classes, drop_path=runtime_args.drop_path, pretrained=runtime_args.teacher_pretrained, qqkkvv=qqkkvv)
     if runtime_args.quant_teacher:
         teacher = get_ofq_qat_model(teacher, runtime_args)
-    if runtime_args.teacher_pretrained and runtime_args.teacher_checkpoint:
+    if runtime_args.teacher_checkpoint:
         load_checkpoint(teacher, runtime_args.teacher_checkpoint, strict=True)
     return teacher
 
@@ -882,7 +985,131 @@ def save_epoch_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, ru
     }
     if loss_scaler is not None:
         state[loss_scaler.state_dict_key] = loss_scaler.state_dict()
-    torch.save(state, output_dir / "last.pth.tar")
+    checkpoint_path = output_dir / f"checkpoint-{epoch + 1}.pth.tar"
+    last_path = output_dir / "last.pth.tar"
+    torch.save(state, checkpoint_path)
+    try:
+        if last_path.exists() or last_path.is_symlink():
+            last_path.unlink()
+        os.link(checkpoint_path, last_path)
+    except OSError:
+        try:
+            if last_path.exists() or last_path.is_symlink():
+                last_path.unlink()
+            os.symlink(checkpoint_path.name, last_path)
+        except OSError:
+            torch.save(state, last_path)
+
+
+def maybe_unwrap_ddp(model: nn.Module) -> nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+
+def set_attention_mode(model: nn.Module, collect_attention: bool = False, qqkkvv: bool = False) -> None:
+    for module in model.modules():
+        module_name = type(module).__name__
+        is_swin_attention = module_name == "ShiftedWindowAttention" or module_name.startswith("QAttention_swin")
+        if hasattr(module, "collect_attention") or is_swin_attention:
+            setattr(module, "collect_attention", collect_attention)
+        if hasattr(module, "qqkkvv"):
+            setattr(module, "qqkkvv", qqkkvv)
+
+
+def clone_ref_model(student_model: nn.Module) -> nn.Module:
+    student_core = maybe_unwrap_ddp(student_model)
+    ref_model = copy.deepcopy(student_core)
+    ref_model.cuda()
+    ref_model.eval()
+    for param in ref_model.parameters():
+        param.requires_grad_(False)
+    set_attention_mode(ref_model, collect_attention=True, qqkkvv=False)
+    return ref_model
+
+
+@torch.no_grad()
+def update_ref_model(student_model: nn.Module, ref_model: nn.Module, momentum: float) -> None:
+    student_core = maybe_unwrap_ddp(student_model)
+    student_params = dict(student_core.named_parameters())
+    for name, ref_param in ref_model.named_parameters():
+        src = student_params[name]
+        ref_param.data.mul_(momentum).add_(src.data, alpha=1.0 - momentum)
+
+    student_buffers = dict(student_core.named_buffers())
+    for name, ref_buffer in ref_model.named_buffers():
+        src = student_buffers[name]
+        if torch.is_floating_point(ref_buffer):
+            ref_buffer.data.mul_(momentum).add_(src.data, alpha=1.0 - momentum)
+        else:
+            ref_buffer.data.copy_(src.data)
+
+
+def extract_attn_prob_list(attn_info):
+    if attn_info is None:
+        return []
+    extracted = []
+    for layer_info in attn_info:
+        if layer_info is None:
+            continue
+        if isinstance(layer_info, (tuple, list)):
+            attn_tensor = layer_info[0]
+        else:
+            attn_tensor = layer_info
+        if torch.is_tensor(attn_tensor):
+            extracted.append(attn_tensor)
+    return extracted
+
+
+OSCILLATING_SWIN_HEADS = (
+    (5, 2),
+    (10, 14),
+    (5, 1),
+    (4, 1),
+    (9, 10),
+)
+
+
+def attention_kl_consistency_loss(student_attn_info, ref_attn_info, head_mode: str = "all") -> torch.Tensor:
+    student_list = extract_attn_prob_list(student_attn_info)
+    ref_list = extract_attn_prob_list(ref_attn_info)
+    if not student_list or not ref_list:
+        if student_list:
+            return student_list[0].new_zeros(())
+        if ref_list:
+            return ref_list[0].new_zeros(())
+        return torch.zeros((), device="cuda")
+
+    if head_mode not in {"all", "oscillating_top5"}:
+        raise NotImplementedError(f"Unsupported ref head mode: {head_mode}")
+
+    total = student_list[0].new_zeros(())
+    count = 0
+    selected_heads = None
+    if head_mode == "oscillating_top5":
+        selected_heads = OSCILLATING_SWIN_HEADS
+
+    if selected_heads is None:
+        selected_items = [
+            (layer_idx, None)
+            for layer_idx in range(min(len(student_list), len(ref_list)))
+        ]
+    else:
+        selected_items = selected_heads
+
+    for layer_idx, head_idx in selected_items:
+        if layer_idx >= len(student_list) or layer_idx >= len(ref_list):
+            continue
+        student_attn = student_list[layer_idx]
+        ref_attn = ref_list[layer_idx]
+        if head_idx is not None:
+            if student_attn.ndim < 4 or head_idx >= student_attn.shape[1] or head_idx >= ref_attn.shape[1]:
+                continue
+            student_attn = student_attn[:, head_idx : head_idx + 1]
+            ref_attn = ref_attn[:, head_idx : head_idx + 1]
+        student_log_prob = torch.log(student_attn.clamp_min(1e-8))
+        ref_prob = ref_attn.clamp_min(1e-8)
+        total = total + F.kl_div(student_log_prob, ref_prob, reduction="batchmean")
+        count += 1
+    return total / max(count, 1)
 
 
 def setup_alpha(model: nn.Module, loader, runtime_args: SimpleNamespace, amp_autocast):
@@ -999,7 +1226,7 @@ def validate_ofq(model: nn.Module, loader, loss_fn, runtime_args: SimpleNamespac
     return {"loss": losses_m.avg, "top1": top1_m.avg, "top5": top5_m.avg}
 
 
-def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.optim.Optimizer, loss_fn, runtime_args: SimpleNamespace, lr_scheduler: WarmupCosineScheduler, output_dir: Path, amp_autocast, loss_scaler, teacher: Optional[nn.Module], mixup_fn):
+def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.optim.Optimizer, loss_fn, runtime_args: SimpleNamespace, lr_scheduler: WarmupCosineScheduler, output_dir: Path, amp_autocast, loss_scaler, teacher: Optional[nn.Module], mixup_fn, ref_model: Optional[nn.Module] = None):
     if runtime_args.mixup_off_epoch and epoch >= runtime_args.mixup_off_epoch:
         if runtime_args.prefetcher and hasattr(loader, "mixup_enabled"):
             loader.mixup_enabled = False
@@ -1010,6 +1237,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     losses_m = AverageMeter()
+    base_losses_m = AverageMeter()
+    ref_attn_kl_losses_m = AverageMeter()
     accum_steps = max(1, int(getattr(runtime_args, "grad_accum_steps", 1)))
     model.train()
     optimizer.zero_grad()
@@ -1072,11 +1301,34 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                     student_logit = student_logit[0] if isinstance(student_logit, tuple) else student_logit
                     loss = loss_fn(student_logit, target)
 
+                base_loss_for_log = loss.detach()
+                ref_attn_kl_loss = loss.new_zeros(())
+                use_ref_scheme = (
+                    runtime_args.train_scheme == "ema_ref_attn_kl"
+                    and ref_model is not None
+                    and epoch >= runtime_args.ref_warmup_epochs
+                    and runtime_args.ref_attn_kl_weight > 0
+                )
+                if use_ref_scheme:
+                    with torch.no_grad():
+                        _, ref_attn_info = ref_model(input)
+                    ref_attn_kl_loss = attention_kl_consistency_loss(
+                        student_attn_info,
+                        ref_attn_info,
+                        head_mode=runtime_args.ref_head_mode,
+                    )
+                    loss = loss + runtime_args.ref_attn_kl_weight * ref_attn_kl_loss
+
             loss_for_log = loss.detach()
+            ref_attn_kl_loss_for_log = ref_attn_kl_loss.detach()
             if not runtime_args.distributed:
                 losses_m.update(loss_for_log.item(), input.size(0))
+                base_losses_m.update(base_loss_for_log.item(), input.size(0))
+                ref_attn_kl_losses_m.update(ref_attn_kl_loss_for_log.item(), input.size(0))
 
             scaled_loss = loss / accum_steps
+            if update_step and runtime_args.train_scheme == "ema_ref_attn_kl" and ref_model is not None and runtime_args.ref_update == "prev_step":
+                update_ref_model(model, ref_model, 0.0)
             if loss_scaler is not None:
                 loss_scaler(
                     scaled_loss,
@@ -1097,6 +1349,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
         if update_step:
             optimizer.zero_grad()
             local_update_count += 1
+            if runtime_args.train_scheme == "ema_ref_attn_kl" and ref_model is not None and runtime_args.ref_update == "ema":
+                update_ref_model(model, ref_model, runtime_args.ref_momentum)
             if runtime_args.local_rank == 0 and runtime_args.save_step_checkpoints:
                 interval = max(1, int(runtime_args.step_checkpoint_interval))
                 if warmup_updates > 0:
@@ -1122,11 +1376,17 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
             lr = optimizer.param_groups[0]["lr"]
             if runtime_args.distributed:
                 reduced_loss = reduce_tensor(loss.data, runtime_args.world_size)
+                reduced_base_loss = reduce_tensor(base_loss_for_log, runtime_args.world_size)
+                reduced_ref_attn_kl_loss = reduce_tensor(ref_attn_kl_loss_for_log, runtime_args.world_size)
                 losses_m.update(reduced_loss.item(), input.size(0))
+                base_losses_m.update(reduced_base_loss.item(), input.size(0))
+                ref_attn_kl_losses_m.update(reduced_ref_attn_kl_loss.item(), input.size(0))
             if runtime_args.local_rank == 0:
                 print(
                     f"Train: {epoch} [{batch_idx:>4d}/{len(loader)} ({100. * batch_idx / last_idx:>3.0f}%)]  "
                     f"Loss: {losses_m.val:>9.6f} ({losses_m.avg:>6.4f})  "
+                    f"BaseLoss: {base_losses_m.val:>9.6f} ({base_losses_m.avg:>6.4f})  "
+                    f"RefAttnKL: {ref_attn_kl_losses_m.val:.3e} ({ref_attn_kl_losses_m.avg:.3e})  "
                     f"Time: {batch_time_m.val:.3f}s, {input.size(0) * runtime_args.world_size / batch_time_m.val:>7.2f}/s  "
                     f"({batch_time_m.avg:.3f}s, {input.size(0) * runtime_args.world_size / batch_time_m.avg:>7.2f}/s)  "
                     f"LR: {lr:.3e}  Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})"
@@ -1168,7 +1428,9 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
         enabled_modules = enable_attention_collection(model)
         if runtime_args.local_rank == 0:
             print(f"Enabled attention collection for {enabled_modules} modules.")
-    if runtime_args.initial_checkpoint:
+    if runtime_args.train_scheme == "ema_ref_attn_kl":
+        set_attention_mode(model, collect_attention=True, qqkkvv=False)
+    if runtime_args.initial_checkpoint and not runtime_args.eval_only:
         load_checkpoint(model, runtime_args.initial_checkpoint, strict=False)
 
     teacher = None
@@ -1188,7 +1450,92 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
     loss_scaler = NativeScaler() if use_amp else None
 
     data_config = resolve_data_config(vars(runtime_args), model=model, verbose=runtime_args.local_rank == 0)
-    dataset_train = create_dataset_compat(runtime_args.dataset, root=runtime_args.data_dir, split=runtime_args.train_split, is_training=True, batch_size=runtime_args.batch_size)
+    if runtime_args.eval_only:
+        dataset_train = create_dataset_compat(
+            runtime_args.dataset,
+            root=runtime_args.data_dir,
+            split=runtime_args.train_split,
+            is_training=True,
+            batch_size=runtime_args.batch_size,
+            subset_ratio=runtime_args.subset_ratio,
+        )
+        train_interpolation = runtime_args.train_interpolation or data_config["interpolation"]
+        loader_train = create_loader_compat(
+            dataset_train,
+            input_size=data_config["input_size"],
+            batch_size=runtime_args.batch_size,
+            is_training=True,
+            use_prefetcher=runtime_args.prefetcher,
+            no_aug=False,
+            re_prob=runtime_args.reprob,
+            re_mode=runtime_args.remode,
+            re_count=runtime_args.recount,
+            re_split=runtime_args.resplit,
+            scale=runtime_args.scale,
+            ratio=runtime_args.ratio,
+            hflip=runtime_args.hflip,
+            vflip=runtime_args.vflip,
+            color_jitter=runtime_args.color_jitter,
+            auto_augment=runtime_args.aa,
+            num_aug_splits=runtime_args.aug_splits,
+            num_aug_repeats=runtime_args.num_aug_repeats,
+            interpolation=train_interpolation,
+            mean=data_config["mean"],
+            std=data_config["std"],
+            num_workers=runtime_args.workers,
+            distributed=runtime_args.distributed,
+            collate_fn=None,
+            pin_memory=runtime_args.pin_mem,
+            use_multi_epochs_loader=runtime_args.use_multi_epochs_loader,
+        )
+        if runtime_args.local_rank == 0:
+            print(f"{len(dataset_train)}")
+        setup_alpha(model, loader_train, runtime_args, amp_autocast)
+        if runtime_args.initial_checkpoint:
+            load_checkpoint(model, runtime_args.initial_checkpoint, strict=False)
+        dataset_eval = create_dataset_compat(
+            runtime_args.dataset,
+            root=runtime_args.data_dir,
+            split=runtime_args.val_split,
+            is_training=False,
+            batch_size=runtime_args.batch_size,
+            subset_ratio=runtime_args.subset_ratio,
+        )
+        loader_eval = create_loader_compat(
+            dataset_eval,
+            input_size=data_config["input_size"],
+            batch_size=runtime_args.validation_batch_size_multiplier * runtime_args.batch_size,
+            is_training=False,
+            use_prefetcher=runtime_args.prefetcher,
+            interpolation=data_config["interpolation"],
+            mean=data_config["mean"],
+            std=data_config["std"],
+            num_workers=runtime_args.workers,
+            distributed=runtime_args.distributed,
+            crop_pct=data_config["crop_pct"],
+            pin_memory=runtime_args.pin_mem,
+        )
+        if runtime_args.local_rank == 0:
+            print(f"{len(dataset_eval)}")
+        if runtime_args.distributed:
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+        validate_loss_fn = nn.CrossEntropyLoss().cuda()
+        try:
+            metrics = validate_ofq(model, loader_eval, validate_loss_fn, runtime_args, amp_autocast)
+            if runtime_args.local_rank == 0:
+                print(f"Eval-only metrics: {metrics}")
+        finally:
+            cleanup_torch_distributed()
+        return
+
+    dataset_train = create_dataset_compat(
+        runtime_args.dataset,
+        root=runtime_args.data_dir,
+        split=runtime_args.train_split,
+        is_training=True,
+        batch_size=runtime_args.batch_size,
+        subset_ratio=runtime_args.subset_ratio,
+    )
 
     collate_fn = None
     mixup_fn = None
@@ -1246,7 +1593,14 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
 
     loader_eval = None
     if not runtime_args.skip_validate:
-        dataset_eval = create_dataset_compat(runtime_args.dataset, root=runtime_args.data_dir, split=runtime_args.val_split, is_training=False, batch_size=runtime_args.batch_size)
+        dataset_eval = create_dataset_compat(
+            runtime_args.dataset,
+            root=runtime_args.data_dir,
+            split=runtime_args.val_split,
+            is_training=False,
+            batch_size=runtime_args.batch_size,
+            subset_ratio=runtime_args.subset_ratio,
+        )
         loader_eval = create_loader_compat(
             dataset_eval,
             input_size=data_config["input_size"],
@@ -1273,6 +1627,19 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
 
     if runtime_args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+
+    ref_model = None
+    if runtime_args.train_scheme == "ema_ref_attn_kl":
+        ref_model = clone_ref_model(model)
+        if runtime_args.local_rank == 0:
+            print(
+                "Enabled EMA refmodel attention-KL scheme: "
+                f"ref_update={runtime_args.ref_update}, "
+                f"momentum={runtime_args.ref_momentum}, "
+                f"attn_kl_weight={runtime_args.ref_attn_kl_weight}, "
+                f"head_mode={runtime_args.ref_head_mode}, "
+                f"warmup_epochs={runtime_args.ref_warmup_epochs}"
+            )
 
     updates_per_epoch = max(1, (len(loader_train) + max(1, runtime_args.grad_accum_steps) - 1) // max(1, runtime_args.grad_accum_steps))
     lr_scheduler = WarmupCosineScheduler(
@@ -1325,6 +1692,7 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                 loss_scaler,
                 teacher,
                 mixup_fn,
+                ref_model,
             )
             if runtime_args.local_rank == 0:
                 print("epoch: ", epoch, "g['lr']: ", optimizer.param_groups[0]["lr"])
@@ -1335,6 +1703,8 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
             )
             if runtime_args.local_rank == 0 and should_save_epoch_checkpoint:
                 save_epoch_checkpoint(model, optimizer, runtime_args, output_dir, epoch, loss_scaler=loss_scaler)
+            if runtime_args.distributed and loader_eval is not None:
+                dist.barrier()
             if loader_eval is not None:
                 validate_ofq(model, loader_eval, validate_loss_fn, runtime_args, amp_autocast)
             if stopped_early:
@@ -1467,8 +1837,8 @@ def ofq_spawn_entry(local_rank: int, cwd_str: str, argv: Sequence[str], env: Dic
 
 
 def invoke_ofq(args: argparse.Namespace, command: Sequence[str], cwd: Path, env: Dict[str, str]) -> int:
-    argv = script_argv_from_command("ofq", command)
     world_size = count_devices(args.devices, args.nproc_per_node)
+    runtime_args = build_ofq_runtime_config(args)
     env = env.copy()
     if args.devices:
         env["CUDA_VISIBLE_DEVICES"] = args.devices
@@ -1479,13 +1849,13 @@ def invoke_ofq(args: argparse.Namespace, command: Sequence[str], cwd: Path, env:
     with patched_environ(env), patched_sys_path([cwd]), patched_cwd(cwd):
         if world_size > 1:
             torch.multiprocessing.spawn(
-                ofq_spawn_entry,
-                args=(str(cwd), argv, env),
+                ofq_spawn_entry_unified,
+                args=(str(cwd), vars(runtime_args), env),
                 nprocs=world_size,
                 join=True,
             )
         else:
-            ofq_spawn_entry(0, str(cwd), argv, env)
+            ofq_spawn_entry_unified(0, str(cwd), vars(runtime_args), env)
     return 0
 
 
@@ -1563,12 +1933,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-kd", dest="use_kd", action="store_true")
     parser.add_argument("--kd-hard-and-soft", dest="kd_hard_and_soft", type=int)
     parser.add_argument("--teacher-pretrained", dest="teacher_pretrained", action="store_true")
+    parser.add_argument("--teacher-checkpoint", dest="teacher_checkpoint", type=str)
     parser.add_argument("--pretrained-initialized", dest="pretrained_initialized", action="store_true")
     parser.add_argument("--quantized", action="store_true")
     parser.add_argument("--qk-reparam", dest="qk_reparam", action="store_true")
     parser.add_argument("--qk-reparam-type", dest="qk_reparam_type", type=int)
     parser.add_argument("--boundary-range", dest="boundary_range", type=float)
     parser.add_argument("--freeze-for-n-epochs", dest="freeze_for_n_epochs", type=int)
+    parser.add_argument("--train-scheme", dest="train_scheme", choices=["baseline", "ema_ref_attn_kl"], default=None, help="OFQ 训练方案名")
+    parser.add_argument("--ref-update", dest="ref_update", choices=["ema", "prev_step"], default=None, help="历史参考模型更新方式")
+    parser.add_argument("--ref-momentum", dest="ref_momentum", type=float, default=None, help="EMA refmodel 动量")
+    parser.add_argument("--ref-attn-kl-weight", dest="ref_attn_kl_weight", type=float, default=None, help="EMA refmodel attention KL 权重")
+    parser.add_argument("--ref-head-mode", dest="ref_head_mode", choices=["all", "oscillating_top5"], default=None, help="refmodel head 级别接口")
+    parser.add_argument("--ref-warmup-epochs", dest="ref_warmup_epochs", type=int, default=None, help="多少个 epoch 后再启用 refmodel attention KL")
 
     parser.add_argument("--quantize-downsample", dest="quantize_downsample", type=str2bool, default=True, help="AOQ 是否量化 downsample")
     parser.add_argument("--amp", action="store_true", help="AOQ mixed precision")
