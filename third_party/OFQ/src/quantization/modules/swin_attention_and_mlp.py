@@ -239,6 +239,10 @@ class QAttention_swin(ShiftedWindowAttention):
         # unpad features
         x = x[:, :H, :W, :].contiguous()
         if self.qqkkvv:
+            q = nn.functional.linear(quant_x, self.q.weight, self.q.bias)
+            k = nn.functional.linear(quant_x, self.k.weight, self.k.bias)
+            q = q.reshape(B * num_windows, self.window_size[0] * self.window_size[1], self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            k = k.reshape(B * num_windows, self.window_size[0] * self.window_size[1], self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
             q_score = torch.matmul(q, q.transpose(-1, -2))
             q_score = q_score / math.sqrt(C // self.num_heads)
             k_score = torch.matmul(k, k.transpose(-1, -2))
@@ -451,6 +455,10 @@ class QAttention_swin_qkreparam(ShiftedWindowAttention):
         # unpad features
         x = x[:, :H, :W, :].contiguous()
         if self.qqkkvv:
+            q = nn.functional.linear(quant_x, self.q.weight, self.q.bias)
+            k = nn.functional.linear(quant_x, self.k.weight, self.k.bias)
+            q = q.reshape(B * num_windows, self.window_size[0] * self.window_size[1], self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            k = k.reshape(B * num_windows, self.window_size[0] * self.window_size[1], self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
             q_score = torch.matmul(q, q.transpose(-1, -2))
             q_score = q_score / math.sqrt(C // self.num_heads)
             k_score = torch.matmul(k, k.transpose(-1, -2))

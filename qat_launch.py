@@ -442,7 +442,9 @@ def build_ofq(args: argparse.Namespace) -> Tuple[List[str], Path, Dict[str, str]
     append_optional_value(command, "--weight-decay", args.weight_decay)
     append_optional_value(command, "--warmup-epochs", args.warmup_epochs)
     append_optional_value(command, "--warmup-lr", args.warmup_lr)
+    append_optional_value(command, "--min-lr", args.min_lr)
     append_optional_value(command, "--resume", normalize_path(args.resume))
+    append_optional_flag(command, "--no-resume-opt", args.no_resume_opt)
     append_optional_value(command, "--checkpoint-hist", args.checkpoint_hist)
     append_optional_value(command, "--epoch-checkpoint-interval", args.epoch_checkpoint_interval)
 
@@ -475,8 +477,24 @@ def build_ofq(args: argparse.Namespace) -> Tuple[List[str], Path, Dict[str, str]
     append_optional_value(command, "--ref-update", args.ref_update)
     append_optional_value(command, "--ref-momentum", args.ref_momentum)
     append_optional_value(command, "--ref-attn-kl-weight", args.ref_attn_kl_weight)
+    append_optional_value(command, "--ref-attn-loss", args.ref_attn_loss)
+    append_optional_value(command, "--ref-logit-kl-weight", args.ref_logit_kl_weight)
+    append_optional_value(command, "--ref-logit-kl-temperature", args.ref_logit_kl_temperature)
+    append_optional_value(command, "--teacher-qk-rel-weight", args.teacher_qk_rel_weight)
+    append_optional_value(command, "--teacher-qk-rel-warmup-epochs", args.teacher_qk_rel_warmup_epochs)
     append_optional_value(command, "--ref-head-mode", args.ref_head_mode)
     append_optional_value(command, "--ref-warmup-epochs", args.ref_warmup_epochs)
+    append_optional_value(command, "--anchor-ref-attn-kl-weight", args.anchor_ref_attn_kl_weight)
+    append_optional_value(command, "--anchor-ref-warmup-epochs", args.anchor_ref_warmup_epochs)
+    append_optional_value(command, "--teacher-attn-kl-weight", args.teacher_attn_kl_weight)
+    append_optional_value(command, "--teacher-attn-kl-warmup-epochs", args.teacher_attn_kl_warmup_epochs)
+    append_optional_value(command, "--ref-attn-kl-weight-epoch-overrides", args.ref_attn_kl_weight_epoch_overrides)
+    append_optional_value(command, "--anchor-ref-attn-kl-weight-epoch-overrides", args.anchor_ref_attn_kl_weight_epoch_overrides)
+    append_optional_value(command, "--epoch-lr-overrides", args.epoch_lr_overrides)
+    append_optional_value(command, "--quant-only-start-epoch", args.quant_only_start_epoch)
+    append_optional_value(command, "--trainable-policy", args.trainable_policy)
+    append_optional_flag(command, "--model-ema", args.model_ema)
+    append_optional_value(command, "--model-ema-decay", args.model_ema_decay)
 
     command.extend(args.extra_arg)
     return command, repo, env
@@ -581,6 +599,8 @@ def create_dataset_compat(dataset_name, root, split, is_training, batch_size, re
 def create_loader_compat(dataset, **kwargs):
     sig = inspect.signature(create_loader)
     filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    if filtered.get("num_workers", 0) == 0 and "persistent_workers" in sig.parameters:
+        filtered["persistent_workers"] = False
     return create_loader(dataset, **filtered)
 
 
@@ -589,6 +609,7 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--skip_validate", action="store_true")
     parser.add_argument("--eval-only", dest="eval_only", action="store_true")
     parser.add_argument("--max_train_updates", type=int)
+    parser.add_argument("--start-epoch", dest="start_epoch", type=int)
     parser.add_argument("--log-interval", dest="log_interval", type=int)
     parser.add_argument("--save_step_checkpoints", action="store_true")
     parser.add_argument("--save_initial_step_checkpoint", action="store_true")
@@ -597,17 +618,21 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--max_step_checkpoints_to_save", type=int)
     parser.add_argument("--collect_attention", action="store_true")
     parser.add_argument("--initial-checkpoint", dest="initial_checkpoint", type=str)
+    parser.add_argument("--post-load-alpha", dest="post_load_alpha", action="store_true")
     parser.add_argument("--no-prefetcher", dest="no_prefetcher", action="store_true")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--pin-mem", dest="pin_mem", action="store_true")
     parser.add_argument("--channels-last", dest="channels_last", action="store_true")
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--aa", type=str)
+    parser.add_argument("--reprob", type=float)
+    parser.add_argument("--color-jitter", dest="color_jitter", type=float)
+    parser.add_argument("--smoothing", type=float)
     parser.add_argument("--mixup", type=float)
     parser.add_argument("--cutmix", type=float)
     parser.add_argument("--mixup-prob", dest="mixup_prob", type=float)
     parser.add_argument("--mixup-switch-prob", dest="mixup_switch_prob", type=float)
     parser.add_argument("--mixup-mode", dest="mixup_mode", type=str)
-    parser.add_argument("--smoothing", type=float)
     parser.add_argument("--native-amp", dest="native_amp", action="store_true")
     parser.add_argument("--gpu_id", type=int)
     parser.add_argument("--teacher-checkpoint", dest="teacher_checkpoint", type=str)
@@ -618,16 +643,61 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--kd-type", dest="kd_type", type=str)
     parser.add_argument("--qk_reparam_type", type=int)
     parser.add_argument("--warmup-lr", dest="warmup_lr", type=float)
+    parser.add_argument("--min-lr", dest="min_lr", type=float)
     parser.add_argument("--recovery-interval", dest="recovery_interval", type=int)
     parser.add_argument("--checkpoint-hist", dest="checkpoint_hist", type=int)
     parser.add_argument("--epoch-checkpoint-interval", dest="epoch_checkpoint_interval", type=int)
     parser.add_argument("--subset-ratio", dest="subset_ratio", type=float)
     parser.add_argument("--initial_checkpoint", dest="initial_checkpoint_alias", type=str)
+    parser.add_argument("--no-resume-opt", dest="no_resume_opt", action="store_true")
+    parser.add_argument("--anchor-ref-attn-kl-weight", dest="anchor_ref_attn_kl_weight", type=float)
+    parser.add_argument("--anchor-ref-warmup-epochs", dest="anchor_ref_warmup_epochs", type=int)
+    parser.add_argument("--teacher-attn-kl-weight", dest="teacher_attn_kl_weight", type=float)
+    parser.add_argument("--teacher-attn-kl-warmup-epochs", dest="teacher_attn_kl_warmup_epochs", type=int)
+    parser.add_argument("--ref-attn-loss", dest="ref_attn_loss", type=str)
+    parser.add_argument("--ref-logit-kl-weight", dest="ref_logit_kl_weight", type=float)
+    parser.add_argument("--ref-logit-kl-temperature", dest="ref_logit_kl_temperature", type=float)
+    parser.add_argument("--teacher-qk-rel-weight", dest="teacher_qk_rel_weight", type=float)
+    parser.add_argument("--teacher-qk-rel-warmup-epochs", dest="teacher_qk_rel_warmup_epochs", type=int)
+    parser.add_argument("--ref-attn-kl-weight-epoch-overrides", dest="ref_attn_kl_weight_epoch_overrides", type=str)
+    parser.add_argument("--anchor-ref-attn-kl-weight-epoch-overrides", dest="anchor_ref_attn_kl_weight_epoch_overrides", type=str)
+    parser.add_argument("--epoch-lr-overrides", dest="epoch_lr_overrides", type=str)
+    parser.add_argument("--quant-only-start-epoch", dest="quant_only_start_epoch", type=int)
+    parser.add_argument("--trainable-policy", dest="trainable_policy", type=str)
+    parser.add_argument("--model-ema", dest="model_ema", action="store_true")
+    parser.add_argument("--model-ema-decay", dest="model_ema_decay", type=float)
     namespace, _ = parser.parse_known_args(list(extra_args))
     overrides = {k: v for k, v in vars(namespace).items() if v is not None and v is not False}
     if "initial_checkpoint_alias" in overrides:
         overrides["initial_checkpoint"] = overrides.pop("initial_checkpoint_alias")
     return overrides
+
+
+def parse_epoch_float_overrides(spec: object) -> Dict[int, float]:
+    if spec is None or spec == "":
+        return {}
+    if isinstance(spec, dict):
+        return {int(k): float(v) for k, v in spec.items()}
+    parsed = {}
+    for item in str(spec).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"epoch override must be epoch:value, got {item!r}")
+        epoch_text, value_text = item.split(":", 1)
+        parsed[int(epoch_text.strip())] = float(value_text.strip())
+    return parsed
+
+
+def epoch_float_value(overrides: Dict[int, float], epoch: int, default: float) -> float:
+    return float(overrides.get(int(epoch), default))
+
+
+def normalize_optional_string(value: object) -> object:
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null", "false", "0"}:
+        return None
+    return value
 
 
 def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
@@ -722,6 +792,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "max_step_checkpoints_to_save": 0,
         "skip_validate": False,
         "eval_only": False,
+        "post_load_alpha": False,
         "apply_q_attn_dropout": 0,
         "act_layer": "gelu",
         "kd_hard_and_soft": 1,
@@ -733,11 +804,28 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "ref_update": "ema",
         "ref_momentum": 0.999,
         "ref_attn_kl_weight": 0.0,
+        "ref_attn_loss": "kl_ref",
+        "ref_logit_kl_weight": 0.0,
+        "ref_logit_kl_temperature": 2.0,
+        "teacher_qk_rel_weight": 0.0,
+        "teacher_qk_rel_warmup_epochs": 0,
         "ref_head_mode": "all",
         "ref_warmup_epochs": 0,
+        "anchor_ref_attn_kl_weight": 0.0,
+        "anchor_ref_warmup_epochs": 0,
+        "teacher_attn_kl_weight": 0.0,
+        "teacher_attn_kl_warmup_epochs": 0,
+        "ref_attn_kl_weight_epoch_overrides": "",
+        "anchor_ref_attn_kl_weight_epoch_overrides": "",
+        "epoch_lr_overrides": "",
+        "quant_only_start_epoch": None,
+        "trainable_policy": "all",
+        "model_ema": False,
+        "model_ema_decay": 0.9999,
         "initial_checkpoint": "",
         "resume": "",
         "no_resume_opt": False,
+        "start_epoch": None,
         "opt": "adamw",
         "lr": 2e-4,
         "weight_decay": 0.0,
@@ -791,6 +879,12 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["warmup_epochs"] = args.warmup_epochs
     if args.warmup_lr is not None:
         defaults["warmup_lr"] = args.warmup_lr
+    if args.min_lr is not None:
+        defaults["min_lr"] = args.min_lr
+    if args.no_resume_opt:
+        defaults["no_resume_opt"] = True
+    if args.start_epoch is not None:
+        defaults["start_epoch"] = args.start_epoch
     if args.grad_accum_steps is not None:
         defaults["grad_accum_steps"] = args.grad_accum_steps
     if args.checkpoint_hist is not None:
@@ -835,12 +929,46 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["ref_momentum"] = args.ref_momentum
     if args.ref_attn_kl_weight is not None:
         defaults["ref_attn_kl_weight"] = args.ref_attn_kl_weight
+    if args.ref_attn_loss is not None:
+        defaults["ref_attn_loss"] = args.ref_attn_loss
+    if args.ref_logit_kl_weight is not None:
+        defaults["ref_logit_kl_weight"] = args.ref_logit_kl_weight
+    if args.ref_logit_kl_temperature is not None:
+        defaults["ref_logit_kl_temperature"] = args.ref_logit_kl_temperature
+    if args.teacher_qk_rel_weight is not None:
+        defaults["teacher_qk_rel_weight"] = args.teacher_qk_rel_weight
+    if args.teacher_qk_rel_warmup_epochs is not None:
+        defaults["teacher_qk_rel_warmup_epochs"] = args.teacher_qk_rel_warmup_epochs
     if args.ref_head_mode is not None:
         defaults["ref_head_mode"] = args.ref_head_mode
     if args.ref_warmup_epochs is not None:
         defaults["ref_warmup_epochs"] = args.ref_warmup_epochs
+    if args.anchor_ref_attn_kl_weight is not None:
+        defaults["anchor_ref_attn_kl_weight"] = args.anchor_ref_attn_kl_weight
+    if args.anchor_ref_warmup_epochs is not None:
+        defaults["anchor_ref_warmup_epochs"] = args.anchor_ref_warmup_epochs
+    if args.teacher_attn_kl_weight is not None:
+        defaults["teacher_attn_kl_weight"] = args.teacher_attn_kl_weight
+    if args.teacher_attn_kl_warmup_epochs is not None:
+        defaults["teacher_attn_kl_warmup_epochs"] = args.teacher_attn_kl_warmup_epochs
+    if args.ref_attn_kl_weight_epoch_overrides is not None:
+        defaults["ref_attn_kl_weight_epoch_overrides"] = args.ref_attn_kl_weight_epoch_overrides
+    if args.anchor_ref_attn_kl_weight_epoch_overrides is not None:
+        defaults["anchor_ref_attn_kl_weight_epoch_overrides"] = args.anchor_ref_attn_kl_weight_epoch_overrides
+    if args.epoch_lr_overrides is not None:
+        defaults["epoch_lr_overrides"] = args.epoch_lr_overrides
+    if args.quant_only_start_epoch is not None:
+        defaults["quant_only_start_epoch"] = args.quant_only_start_epoch
+    if args.trainable_policy is not None:
+        defaults["trainable_policy"] = args.trainable_policy
+    if args.model_ema:
+        defaults["model_ema"] = True
+    if args.model_ema_decay is not None:
+        defaults["model_ema_decay"] = args.model_ema_decay
 
     defaults.update(build_ofq_runtime_overrides(args.extra_arg))
+    defaults["aa"] = normalize_optional_string(defaults.get("aa"))
+    defaults["train_interpolation"] = normalize_optional_string(defaults.get("train_interpolation"))
     defaults["world_size"] = int(defaults["world_size"])
     defaults["lr"] = float(defaults["lr"])
     defaults["warmup_lr"] = float(defaults["warmup_lr"])
@@ -855,8 +983,27 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["epoch_checkpoint_interval"] = int(defaults["epoch_checkpoint_interval"])
     defaults["subset_ratio"] = float(defaults["subset_ratio"])
     defaults["ref_warmup_epochs"] = int(defaults["ref_warmup_epochs"])
+    if defaults.get("start_epoch") is not None:
+        defaults["start_epoch"] = int(defaults["start_epoch"])
     defaults["ref_momentum"] = float(defaults["ref_momentum"])
     defaults["ref_attn_kl_weight"] = float(defaults["ref_attn_kl_weight"])
+    defaults["ref_attn_loss"] = str(defaults.get("ref_attn_loss", "kl_ref"))
+    defaults["ref_logit_kl_weight"] = float(defaults["ref_logit_kl_weight"])
+    defaults["ref_logit_kl_temperature"] = float(defaults["ref_logit_kl_temperature"])
+    defaults["teacher_qk_rel_weight"] = float(defaults["teacher_qk_rel_weight"])
+    defaults["teacher_qk_rel_warmup_epochs"] = int(defaults["teacher_qk_rel_warmup_epochs"])
+    defaults["anchor_ref_attn_kl_weight"] = float(defaults["anchor_ref_attn_kl_weight"])
+    defaults["anchor_ref_warmup_epochs"] = int(defaults["anchor_ref_warmup_epochs"])
+    defaults["teacher_attn_kl_weight"] = float(defaults["teacher_attn_kl_weight"])
+    defaults["teacher_attn_kl_warmup_epochs"] = int(defaults["teacher_attn_kl_warmup_epochs"])
+    if defaults.get("quant_only_start_epoch") is not None:
+        defaults["quant_only_start_epoch"] = int(defaults["quant_only_start_epoch"])
+    defaults["trainable_policy"] = str(defaults.get("trainable_policy") or "all")
+    defaults["ref_attn_kl_weight_epoch_overrides"] = parse_epoch_float_overrides(defaults.get("ref_attn_kl_weight_epoch_overrides"))
+    defaults["anchor_ref_attn_kl_weight_epoch_overrides"] = parse_epoch_float_overrides(defaults.get("anchor_ref_attn_kl_weight_epoch_overrides"))
+    defaults["epoch_lr_overrides"] = parse_epoch_float_overrides(defaults.get("epoch_lr_overrides"))
+    defaults["model_ema"] = bool(defaults.get("model_ema", False))
+    defaults["model_ema_decay"] = float(defaults.get("model_ema_decay", 0.9999))
     defaults["no_prefetcher"] = bool(defaults.get("no_prefetcher", False))
     defaults["prefetcher"] = not defaults["no_prefetcher"]
     defaults["teacher"] = defaults["teacher"] or defaults["model"]
@@ -940,7 +1087,7 @@ def enable_attention_collection(model: nn.Module) -> int:
 
 
 def create_ofq_teacher_model(runtime_args: SimpleNamespace) -> nn.Module:
-    qqkkvv = runtime_args.kd_hard_and_soft in {2, 3}
+    qqkkvv = runtime_args.kd_hard_and_soft in {2, 3} or runtime_args.teacher_qk_rel_weight > 0
     if runtime_args.teacher_type == "deit":
         teacher = create_model(runtime_args.teacher, num_classes=runtime_args.num_classes, drop_rate=runtime_args.drop, pretrained=runtime_args.teacher_pretrained, qqkkvv=qqkkvv)
     else:
@@ -949,6 +1096,8 @@ def create_ofq_teacher_model(runtime_args: SimpleNamespace) -> nn.Module:
         teacher = get_ofq_qat_model(teacher, runtime_args)
     if runtime_args.teacher_checkpoint:
         load_checkpoint(teacher, runtime_args.teacher_checkpoint, strict=True)
+    if runtime_args.teacher_attn_kl_weight > 0 or runtime_args.teacher_qk_rel_weight > 0:
+        set_attention_mode(teacher, collect_attention=True, qqkkvv=qqkkvv)
     return teacher
 
 
@@ -974,7 +1123,7 @@ def save_step_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, run
     return str(save_path)
 
 
-def save_epoch_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, runtime_args: SimpleNamespace, output_dir: Path, epoch: int, loss_scaler=None) -> None:
+def save_epoch_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, runtime_args: SimpleNamespace, output_dir: Path, epoch: int, loss_scaler=None, suffix: str = "") -> None:
     state = {
         "epoch": epoch + 1,
         "arch": runtime_args.model,
@@ -985,8 +1134,8 @@ def save_epoch_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, ru
     }
     if loss_scaler is not None:
         state[loss_scaler.state_dict_key] = loss_scaler.state_dict()
-    checkpoint_path = output_dir / f"checkpoint-{epoch + 1}.pth.tar"
-    last_path = output_dir / "last.pth.tar"
+    checkpoint_path = output_dir / f"checkpoint-{epoch + 1}{suffix}.pth.tar"
+    last_path = output_dir / ("last.pth.tar" if not suffix else f"last{suffix}.pth.tar")
     torch.save(state, checkpoint_path)
     try:
         if last_path.exists() or last_path.is_symlink():
@@ -1026,6 +1175,30 @@ def clone_ref_model(student_model: nn.Module) -> nn.Module:
     return ref_model
 
 
+def clone_model_ema(student_model: nn.Module) -> nn.Module:
+    student_core = maybe_unwrap_ddp(student_model)
+    ema_model = copy.deepcopy(student_core)
+    ema_model.cuda()
+    ema_model.eval()
+    for param in ema_model.parameters():
+        param.requires_grad_(False)
+    set_attention_mode(ema_model, collect_attention=False, qqkkvv=False)
+    return ema_model
+
+
+@torch.no_grad()
+def update_model_ema(student_model: nn.Module, ema_model: nn.Module, decay: float) -> None:
+    student_core = maybe_unwrap_ddp(student_model)
+    student_state = student_core.state_dict()
+    ema_state = ema_model.state_dict()
+    for name, ema_value in ema_state.items():
+        src = student_state[name]
+        if torch.is_floating_point(ema_value):
+            ema_value.mul_(decay).add_(src, alpha=1.0 - decay)
+        else:
+            ema_value.copy_(src)
+
+
 @torch.no_grad()
 def update_ref_model(student_model: nn.Module, ref_model: nn.Module, momentum: float) -> None:
     student_core = maybe_unwrap_ddp(student_model)
@@ -1041,6 +1214,55 @@ def update_ref_model(student_model: nn.Module, ref_model: nn.Module, momentum: f
             ref_buffer.data.mul_(momentum).add_(src.data, alpha=1.0 - momentum)
         else:
             ref_buffer.data.copy_(src.data)
+
+
+def is_quant_or_shift_parameter(name: str) -> bool:
+    quant_tokens = (
+        "input_quant_fn",
+        "lsqw_fn",
+        "statsq_fn",
+        "qk_quant",
+        "v_quant",
+        "quan_a_",
+        "move_",
+    )
+    return any(token in name for token in quant_tokens)
+
+
+def is_head_norm_parameter(name: str) -> bool:
+    return name.startswith("head.") or ".norm" in name or name.startswith("norm.")
+
+
+def is_attention_projection_parameter(name: str) -> bool:
+    return ".attn.q." in name or ".attn.k." in name or ".attn.v." in name or ".attn.proj." in name
+
+
+def set_trainable_policy(model: nn.Module, policy: str) -> Tuple[int, int]:
+    policy = str(policy or "all")
+    if policy not in {"all", "quant", "head_norm_quant", "head_norm_attn_quant"}:
+        raise ValueError(f"Unsupported trainable policy: {policy}")
+    trainable = 0
+    frozen = 0
+    for name, param in maybe_unwrap_ddp(model).named_parameters():
+        if policy == "all":
+            should_train = True
+        elif policy == "quant":
+            should_train = is_quant_or_shift_parameter(name)
+        elif policy == "head_norm_quant":
+            should_train = is_quant_or_shift_parameter(name) or is_head_norm_parameter(name)
+        else:
+            should_train = is_quant_or_shift_parameter(name) or is_head_norm_parameter(name) or is_attention_projection_parameter(name)
+        param.requires_grad_(should_train)
+        if should_train:
+            trainable += param.numel()
+        else:
+            frozen += param.numel()
+    return trainable, frozen
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = float(lr)
 
 
 def extract_attn_prob_list(attn_info):
@@ -1067,8 +1289,50 @@ OSCILLATING_SWIN_HEADS = (
     (9, 10),
 )
 
+OSCILLATING_SWIN_HEADS_TOP10 = OSCILLATING_SWIN_HEADS + (
+    (10, 13),
+    (10, 15),
+    (9, 9),
+    (9, 11),
+    (5, 3),
+)
 
-def attention_kl_consistency_loss(student_attn_info, ref_attn_info, head_mode: str = "all") -> torch.Tensor:
+OSCILLATING_SWIN_HEADS_TOP15 = OSCILLATING_SWIN_HEADS_TOP10 + (
+    (4, 2),
+    (6, 1),
+    (7, 4),
+    (8, 8),
+    (11, 14),
+)
+
+
+def parse_ref_head_mode(head_mode: str):
+    if head_mode == "all":
+        return None
+    if head_mode == "oscillating_top5":
+        return OSCILLATING_SWIN_HEADS
+    if head_mode == "oscillating_top10":
+        return OSCILLATING_SWIN_HEADS_TOP10
+    if head_mode == "oscillating_top15":
+        return OSCILLATING_SWIN_HEADS_TOP15
+    if head_mode.startswith("custom:"):
+        items = []
+        raw_items = [item.strip() for item in head_mode[len("custom:") :].split(",") if item.strip()]
+        for raw_item in raw_items:
+            if ":" not in raw_item:
+                raise ValueError(f"Invalid custom ref head item: {raw_item}")
+            layer_idx, head_idx = raw_item.split(":", 1)
+            items.append((int(layer_idx), int(head_idx)))
+        if len(items) < len(OSCILLATING_SWIN_HEADS):
+            raise ValueError("custom ref head mode must include at least five heads")
+        missing = [head for head in OSCILLATING_SWIN_HEADS if head not in items]
+        if missing:
+            raise ValueError(f"custom ref head mode must include oscillating_top5 heads: {missing}")
+        return tuple(items)
+    raise NotImplementedError(f"Unsupported ref head mode: {head_mode}")
+
+
+def attention_kl_consistency_loss(student_attn_info, ref_attn_info, head_mode: str = "all", loss_type: str = "kl_ref") -> torch.Tensor:
     student_list = extract_attn_prob_list(student_attn_info)
     ref_list = extract_attn_prob_list(ref_attn_info)
     if not student_list or not ref_list:
@@ -1078,14 +1342,9 @@ def attention_kl_consistency_loss(student_attn_info, ref_attn_info, head_mode: s
             return ref_list[0].new_zeros(())
         return torch.zeros((), device="cuda")
 
-    if head_mode not in {"all", "oscillating_top5"}:
-        raise NotImplementedError(f"Unsupported ref head mode: {head_mode}")
-
     total = student_list[0].new_zeros(())
     count = 0
-    selected_heads = None
-    if head_mode == "oscillating_top5":
-        selected_heads = OSCILLATING_SWIN_HEADS
+    selected_heads = parse_ref_head_mode(head_mode)
 
     if selected_heads is None:
         selected_items = [
@@ -1105,10 +1364,58 @@ def attention_kl_consistency_loss(student_attn_info, ref_attn_info, head_mode: s
                 continue
             student_attn = student_attn[:, head_idx : head_idx + 1]
             ref_attn = ref_attn[:, head_idx : head_idx + 1]
-        student_log_prob = torch.log(student_attn.clamp_min(1e-8))
+        student_prob = student_attn.clamp_min(1e-8)
         ref_prob = ref_attn.clamp_min(1e-8)
-        total = total + F.kl_div(student_log_prob, ref_prob, reduction="batchmean")
+        if loss_type == "kl_ref":
+            total = total + F.kl_div(torch.log(student_prob), ref_prob, reduction="batchmean")
+        elif loss_type == "symmetric_kl":
+            student_to_ref = F.kl_div(torch.log(student_prob), ref_prob, reduction="batchmean")
+            ref_to_student = F.kl_div(torch.log(ref_prob), student_prob, reduction="batchmean")
+            total = total + 0.5 * (student_to_ref + ref_to_student)
+        elif loss_type == "js":
+            mixed_prob = 0.5 * (student_prob + ref_prob)
+            student_js = F.kl_div(torch.log(student_prob), mixed_prob, reduction="batchmean")
+            ref_js = F.kl_div(torch.log(ref_prob), mixed_prob, reduction="batchmean")
+            total = total + 0.5 * (student_js + ref_js)
+        else:
+            raise NotImplementedError(f"Unsupported ref attention loss: {loss_type}")
         count += 1
+    return total / max(count, 1)
+
+
+def logits_kl_consistency_loss(student_logits: torch.Tensor, ref_logits: torch.Tensor, temperature: float = 2.0) -> torch.Tensor:
+    temp = max(float(temperature), 1e-6)
+    student_log_prob = F.log_softmax(student_logits / temp, dim=-1)
+    ref_prob = F.softmax(ref_logits / temp, dim=-1)
+    return F.kl_div(student_log_prob, ref_prob, reduction="batchmean") * (temp * temp)
+
+
+def teacher_qk_relation_loss(student_attn_info, teacher_attn_info) -> torch.Tensor:
+    if student_attn_info is None or teacher_attn_info is None:
+        return torch.zeros((), device="cuda")
+    total = None
+    count = 0
+    for student_layer, teacher_layer in zip(student_attn_info, teacher_attn_info):
+        if not isinstance(student_layer, (tuple, list)) or not isinstance(teacher_layer, (tuple, list)):
+            continue
+        if len(student_layer) < 3 or len(teacher_layer) < 3:
+            continue
+        for idx in (1, 2):
+            student_tensor = student_layer[idx]
+            teacher_tensor = teacher_layer[idx]
+            if not torch.is_tensor(student_tensor) or not torch.is_tensor(teacher_tensor):
+                continue
+            student_rel = F.normalize(student_tensor.flatten(1).float(), dim=1)
+            teacher_rel = F.normalize(teacher_tensor.flatten(1).float(), dim=1)
+            layer_loss = F.mse_loss(student_rel, teacher_rel)
+            total = layer_loss if total is None else total + layer_loss
+            count += 1
+    if total is None:
+        if isinstance(student_attn_info, (tuple, list)) and student_attn_info and isinstance(student_attn_info[0], (tuple, list)):
+            first_tensor = next((item for item in student_attn_info[0] if torch.is_tensor(item)), None)
+            if first_tensor is not None:
+                return first_tensor.new_zeros(())
+        return torch.zeros((), device="cuda")
     return total / max(count, 1)
 
 
@@ -1226,7 +1533,7 @@ def validate_ofq(model: nn.Module, loader, loss_fn, runtime_args: SimpleNamespac
     return {"loss": losses_m.avg, "top1": top1_m.avg, "top5": top5_m.avg}
 
 
-def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.optim.Optimizer, loss_fn, runtime_args: SimpleNamespace, lr_scheduler: WarmupCosineScheduler, output_dir: Path, amp_autocast, loss_scaler, teacher: Optional[nn.Module], mixup_fn, ref_model: Optional[nn.Module] = None):
+def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.optim.Optimizer, loss_fn, runtime_args: SimpleNamespace, lr_scheduler: WarmupCosineScheduler, output_dir: Path, amp_autocast, loss_scaler, teacher: Optional[nn.Module], mixup_fn, ref_model: Optional[nn.Module] = None, anchor_ref_model: Optional[nn.Module] = None, model_ema: Optional[nn.Module] = None):
     if runtime_args.mixup_off_epoch and epoch >= runtime_args.mixup_off_epoch:
         if runtime_args.prefetcher and hasattr(loader, "mixup_enabled"):
             loader.mixup_enabled = False
@@ -1239,7 +1546,21 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     losses_m = AverageMeter()
     base_losses_m = AverageMeter()
     ref_attn_kl_losses_m = AverageMeter()
+    ref_logit_kl_losses_m = AverageMeter()
+    anchor_ref_attn_kl_losses_m = AverageMeter()
+    teacher_attn_kl_losses_m = AverageMeter()
+    teacher_qk_rel_losses_m = AverageMeter()
     accum_steps = max(1, int(getattr(runtime_args, "grad_accum_steps", 1)))
+    ref_attn_kl_weight = epoch_float_value(
+        runtime_args.ref_attn_kl_weight_epoch_overrides,
+        epoch,
+        runtime_args.ref_attn_kl_weight,
+    )
+    anchor_ref_attn_kl_weight = epoch_float_value(
+        runtime_args.anchor_ref_attn_kl_weight_epoch_overrides,
+        epoch,
+        runtime_args.anchor_ref_attn_kl_weight,
+    )
     model.train()
     optimizer.zero_grad()
     end = time.time()
@@ -1303,28 +1624,94 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
 
                 base_loss_for_log = loss.detach()
                 ref_attn_kl_loss = loss.new_zeros(())
+                ref_logit_kl_loss = loss.new_zeros(())
+                anchor_ref_attn_kl_loss = loss.new_zeros(())
+                teacher_attn_kl_loss = loss.new_zeros(())
+                teacher_qk_rel_loss = loss.new_zeros(())
                 use_ref_scheme = (
                     runtime_args.train_scheme == "ema_ref_attn_kl"
                     and ref_model is not None
                     and epoch >= runtime_args.ref_warmup_epochs
-                    and runtime_args.ref_attn_kl_weight > 0
+                    and (ref_attn_kl_weight > 0 or runtime_args.ref_logit_kl_weight > 0)
                 )
                 if use_ref_scheme:
                     with torch.no_grad():
-                        _, ref_attn_info = ref_model(input)
-                    ref_attn_kl_loss = attention_kl_consistency_loss(
+                        ref_logits, ref_attn_info = ref_model(input)
+                    if ref_attn_kl_weight > 0:
+                        ref_attn_kl_loss = attention_kl_consistency_loss(
+                            student_attn_info,
+                            ref_attn_info,
+                            head_mode=runtime_args.ref_head_mode,
+                            loss_type=runtime_args.ref_attn_loss,
+                        )
+                        loss = loss + ref_attn_kl_weight * ref_attn_kl_loss
+                    if runtime_args.ref_logit_kl_weight > 0:
+                        ref_logit_kl_loss = logits_kl_consistency_loss(
+                            student_logit,
+                            ref_logits,
+                            temperature=runtime_args.ref_logit_kl_temperature,
+                        )
+                        loss = loss + runtime_args.ref_logit_kl_weight * ref_logit_kl_loss
+                use_anchor_ref_scheme = (
+                    runtime_args.train_scheme == "ema_ref_attn_kl"
+                    and anchor_ref_model is not None
+                    and epoch >= runtime_args.anchor_ref_warmup_epochs
+                    and anchor_ref_attn_kl_weight > 0
+                )
+                if use_anchor_ref_scheme:
+                    with torch.no_grad():
+                        _, anchor_ref_attn_info = anchor_ref_model(input)
+                    anchor_ref_attn_kl_loss = attention_kl_consistency_loss(
                         student_attn_info,
-                        ref_attn_info,
+                        anchor_ref_attn_info,
                         head_mode=runtime_args.ref_head_mode,
+                        loss_type=runtime_args.ref_attn_loss,
                     )
-                    loss = loss + runtime_args.ref_attn_kl_weight * ref_attn_kl_loss
+                    loss = loss + anchor_ref_attn_kl_weight * anchor_ref_attn_kl_loss
+                use_teacher_attn_scheme = (
+                    runtime_args.train_scheme == "ema_ref_attn_kl"
+                    and teacher is not None
+                    and epoch >= runtime_args.teacher_attn_kl_warmup_epochs
+                    and runtime_args.teacher_attn_kl_weight > 0
+                )
+                if use_teacher_attn_scheme:
+                    with torch.no_grad():
+                        teacher_attn_output = teacher(input)
+                    if isinstance(teacher_attn_output, tuple):
+                        teacher_attn_info_for_kl = teacher_attn_output[1] if len(teacher_attn_output) > 1 else None
+                    else:
+                        teacher_attn_info_for_kl = None
+                    teacher_attn_kl_loss = attention_kl_consistency_loss(
+                        student_attn_info,
+                        teacher_attn_info_for_kl,
+                        head_mode=runtime_args.ref_head_mode,
+                        loss_type=runtime_args.ref_attn_loss,
+                    )
+                    loss = loss + runtime_args.teacher_attn_kl_weight * teacher_attn_kl_loss
+                use_teacher_qk_rel_scheme = (
+                    runtime_args.train_scheme == "ema_ref_attn_kl"
+                    and teacher_attn_info is not None
+                    and epoch >= runtime_args.teacher_qk_rel_warmup_epochs
+                    and runtime_args.teacher_qk_rel_weight > 0
+                )
+                if use_teacher_qk_rel_scheme:
+                    teacher_qk_rel_loss = teacher_qk_relation_loss(student_attn_info, teacher_attn_info)
+                    loss = loss + runtime_args.teacher_qk_rel_weight * teacher_qk_rel_loss
 
             loss_for_log = loss.detach()
             ref_attn_kl_loss_for_log = ref_attn_kl_loss.detach()
+            ref_logit_kl_loss_for_log = ref_logit_kl_loss.detach()
+            anchor_ref_attn_kl_loss_for_log = anchor_ref_attn_kl_loss.detach()
+            teacher_attn_kl_loss_for_log = teacher_attn_kl_loss.detach()
+            teacher_qk_rel_loss_for_log = teacher_qk_rel_loss.detach()
             if not runtime_args.distributed:
                 losses_m.update(loss_for_log.item(), input.size(0))
                 base_losses_m.update(base_loss_for_log.item(), input.size(0))
                 ref_attn_kl_losses_m.update(ref_attn_kl_loss_for_log.item(), input.size(0))
+                ref_logit_kl_losses_m.update(ref_logit_kl_loss_for_log.item(), input.size(0))
+                anchor_ref_attn_kl_losses_m.update(anchor_ref_attn_kl_loss_for_log.item(), input.size(0))
+                teacher_attn_kl_losses_m.update(teacher_attn_kl_loss_for_log.item(), input.size(0))
+                teacher_qk_rel_losses_m.update(teacher_qk_rel_loss_for_log.item(), input.size(0))
 
             scaled_loss = loss / accum_steps
             if update_step and runtime_args.train_scheme == "ema_ref_attn_kl" and ref_model is not None and runtime_args.ref_update == "prev_step":
@@ -1349,6 +1736,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
         if update_step:
             optimizer.zero_grad()
             local_update_count += 1
+            if model_ema is not None:
+                update_model_ema(model, model_ema, runtime_args.model_ema_decay)
             if runtime_args.train_scheme == "ema_ref_attn_kl" and ref_model is not None and runtime_args.ref_update == "ema":
                 update_ref_model(model, ref_model, runtime_args.ref_momentum)
             if runtime_args.local_rank == 0 and runtime_args.save_step_checkpoints:
@@ -1378,18 +1767,31 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 reduced_loss = reduce_tensor(loss.data, runtime_args.world_size)
                 reduced_base_loss = reduce_tensor(base_loss_for_log, runtime_args.world_size)
                 reduced_ref_attn_kl_loss = reduce_tensor(ref_attn_kl_loss_for_log, runtime_args.world_size)
+                reduced_ref_logit_kl_loss = reduce_tensor(ref_logit_kl_loss_for_log, runtime_args.world_size)
+                reduced_anchor_ref_attn_kl_loss = reduce_tensor(anchor_ref_attn_kl_loss_for_log, runtime_args.world_size)
+                reduced_teacher_attn_kl_loss = reduce_tensor(teacher_attn_kl_loss_for_log, runtime_args.world_size)
+                reduced_teacher_qk_rel_loss = reduce_tensor(teacher_qk_rel_loss_for_log, runtime_args.world_size)
                 losses_m.update(reduced_loss.item(), input.size(0))
                 base_losses_m.update(reduced_base_loss.item(), input.size(0))
                 ref_attn_kl_losses_m.update(reduced_ref_attn_kl_loss.item(), input.size(0))
+                ref_logit_kl_losses_m.update(reduced_ref_logit_kl_loss.item(), input.size(0))
+                anchor_ref_attn_kl_losses_m.update(reduced_anchor_ref_attn_kl_loss.item(), input.size(0))
+                teacher_attn_kl_losses_m.update(reduced_teacher_attn_kl_loss.item(), input.size(0))
+                teacher_qk_rel_losses_m.update(reduced_teacher_qk_rel_loss.item(), input.size(0))
             if runtime_args.local_rank == 0:
                 print(
                     f"Train: {epoch} [{batch_idx:>4d}/{len(loader)} ({100. * batch_idx / last_idx:>3.0f}%)]  "
                     f"Loss: {losses_m.val:>9.6f} ({losses_m.avg:>6.4f})  "
                     f"BaseLoss: {base_losses_m.val:>9.6f} ({base_losses_m.avg:>6.4f})  "
                     f"RefAttnKL: {ref_attn_kl_losses_m.val:.3e} ({ref_attn_kl_losses_m.avg:.3e})  "
+                    f"RefLogitKL: {ref_logit_kl_losses_m.val:.3e} ({ref_logit_kl_losses_m.avg:.3e})  "
+                    f"AnchorRefAttnKL: {anchor_ref_attn_kl_losses_m.val:.3e} ({anchor_ref_attn_kl_losses_m.avg:.3e})  "
+                    f"TeacherAttnKL: {teacher_attn_kl_losses_m.val:.3e} ({teacher_attn_kl_losses_m.avg:.3e})  "
+                    f"TeacherQKRel: {teacher_qk_rel_losses_m.val:.3e} ({teacher_qk_rel_losses_m.avg:.3e})  "
                     f"Time: {batch_time_m.val:.3f}s, {input.size(0) * runtime_args.world_size / batch_time_m.val:>7.2f}/s  "
                     f"({batch_time_m.avg:.3f}s, {input.size(0) * runtime_args.world_size / batch_time_m.avg:>7.2f}/s)  "
-                    f"LR: {lr:.3e}  Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})"
+                    f"LR: {lr:.3e}  RefW: {ref_attn_kl_weight:.3e}  AnchorRefW: {anchor_ref_attn_kl_weight:.3e}  "
+                    f"Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})"
                 )
 
         if runtime_args.max_train_updates and local_update_count >= runtime_args.max_train_updates:
@@ -1416,7 +1818,7 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
     random_seed(runtime_args.seed, runtime_args.rank)
     import src  # noqa: F401
 
-    qqkkvv = runtime_args.kd_hard_and_soft in {2, 3}
+    qqkkvv = runtime_args.kd_hard_and_soft in {2, 3} or runtime_args.teacher_qk_rel_weight > 0
     if runtime_args.model_type == "deit":
         model = create_model(runtime_args.model, num_classes=runtime_args.num_classes, drop_rate=runtime_args.drop, pretrained=runtime_args.pretrained, qqkkvv=qqkkvv)
     else:
@@ -1429,9 +1831,8 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
         if runtime_args.local_rank == 0:
             print(f"Enabled attention collection for {enabled_modules} modules.")
     if runtime_args.train_scheme == "ema_ref_attn_kl":
-        set_attention_mode(model, collect_attention=True, qqkkvv=False)
-    if runtime_args.initial_checkpoint and not runtime_args.eval_only:
-        load_checkpoint(model, runtime_args.initial_checkpoint, strict=False)
+        set_attention_mode(model, collect_attention=True, qqkkvv=qqkkvv)
+    load_initial_after_alpha = bool(runtime_args.initial_checkpoint and not runtime_args.eval_only)
 
     teacher = None
     runtime_args.use_kd = runtime_args.use_kd or runtime_args.use_token_kd
@@ -1493,6 +1894,8 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
         setup_alpha(model, loader_train, runtime_args, amp_autocast)
         if runtime_args.initial_checkpoint:
             load_checkpoint(model, runtime_args.initial_checkpoint, strict=False)
+            if runtime_args.post_load_alpha:
+                setup_alpha(model, loader_train, runtime_args, amp_autocast)
         dataset_eval = create_dataset_compat(
             runtime_args.dataset,
             root=runtime_args.data_dir,
@@ -1525,6 +1928,7 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
             if runtime_args.local_rank == 0:
                 print(f"Eval-only metrics: {metrics}")
         finally:
+            shutdown_data_loader(loader_eval)
             cleanup_torch_distributed()
         return
 
@@ -1619,27 +2023,45 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
             print(f"{len(dataset_eval)}")
 
     setup_alpha(model, loader_train, runtime_args, amp_autocast)
+    if load_initial_after_alpha:
+        load_checkpoint(model, runtime_args.initial_checkpoint, strict=False)
     optimizer = create_ofq_optimizer(runtime_args, model)
 
     start_epoch = 0
     if runtime_args.resume:
         start_epoch = resume_checkpoint(model, runtime_args.resume, optimizer=None if runtime_args.no_resume_opt else optimizer, loss_scaler=None if runtime_args.no_resume_opt else loss_scaler, log_info=runtime_args.local_rank == 0) or 0
+    if runtime_args.start_epoch is not None:
+        start_epoch = int(runtime_args.start_epoch)
 
     if runtime_args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            find_unused_parameters=runtime_args.quant_only_start_epoch is not None,
+        )
 
     ref_model = None
+    anchor_ref_model = None
+    model_ema = None
     if runtime_args.train_scheme == "ema_ref_attn_kl":
         ref_model = clone_ref_model(model)
+        if runtime_args.anchor_ref_attn_kl_weight > 0 or runtime_args.anchor_ref_attn_kl_weight_epoch_overrides:
+            anchor_ref_model = clone_ref_model(model)
         if runtime_args.local_rank == 0:
             print(
                 "Enabled EMA refmodel attention-KL scheme: "
                 f"ref_update={runtime_args.ref_update}, "
                 f"momentum={runtime_args.ref_momentum}, "
                 f"attn_kl_weight={runtime_args.ref_attn_kl_weight}, "
+                f"anchor_attn_kl_weight={runtime_args.anchor_ref_attn_kl_weight}, "
                 f"head_mode={runtime_args.ref_head_mode}, "
-                f"warmup_epochs={runtime_args.ref_warmup_epochs}"
+                f"warmup_epochs={runtime_args.ref_warmup_epochs}, "
+                f"anchor_warmup_epochs={runtime_args.anchor_ref_warmup_epochs}"
             )
+    if runtime_args.model_ema:
+        model_ema = clone_model_ema(model)
+        if runtime_args.local_rank == 0:
+            print(f"Enabled student weight EMA: decay={runtime_args.model_ema_decay}")
 
     updates_per_epoch = max(1, (len(loader_train) + max(1, runtime_args.grad_accum_steps) - 1) // max(1, runtime_args.grad_accum_steps))
     lr_scheduler = WarmupCosineScheduler(
@@ -1675,6 +2097,22 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
 
     try:
         for epoch in range(start_epoch, runtime_args.epochs):
+            epoch_lr_override = runtime_args.epoch_lr_overrides.get(epoch)
+            if epoch_lr_override is not None:
+                lr_scheduler.base_lr = float(epoch_lr_override)
+                lr_scheduler.min_lr = float(epoch_lr_override)
+                set_optimizer_lr(optimizer, float(epoch_lr_override))
+                if runtime_args.local_rank == 0:
+                    print(f"Applied epoch LR override: epoch={epoch}, lr={epoch_lr_override}")
+            quant_only_enabled = runtime_args.quant_only_start_epoch is not None and epoch >= runtime_args.quant_only_start_epoch
+            active_trainable_policy = runtime_args.trainable_policy if quant_only_enabled else "all"
+            trainable_params, frozen_params = set_trainable_policy(model, active_trainable_policy)
+            if runtime_args.local_rank == 0:
+                print(
+                    "Trainable parameter policy: "
+                    f"epoch={epoch}, quant_only={quant_only_enabled}, policy={active_trainable_policy}, "
+                    f"trainable={trainable_params}, frozen={frozen_params}"
+                )
             if hasattr(dataset_train, "set_epoch"):
                 dataset_train.set_epoch(epoch)
             if runtime_args.distributed and hasattr(loader_train, "sampler") and hasattr(loader_train.sampler, "set_epoch"):
@@ -1693,6 +2131,8 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                 teacher,
                 mixup_fn,
                 ref_model,
+                anchor_ref_model,
+                model_ema,
             )
             if runtime_args.local_rank == 0:
                 print("epoch: ", epoch, "g['lr']: ", optimizer.param_groups[0]["lr"])
@@ -1703,6 +2143,8 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
             )
             if runtime_args.local_rank == 0 and should_save_epoch_checkpoint:
                 save_epoch_checkpoint(model, optimizer, runtime_args, output_dir, epoch, loss_scaler=loss_scaler)
+                if model_ema is not None:
+                    save_epoch_checkpoint(model_ema, optimizer, runtime_args, output_dir, epoch, loss_scaler=loss_scaler, suffix=".ema")
             if runtime_args.distributed and loader_eval is not None:
                 dist.barrier()
             if loader_eval is not None:
@@ -1712,6 +2154,8 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                     print(f"Stopped early after {local_update_count} optimizer updates in epoch {epoch}.")
                 break
     finally:
+        shutdown_data_loader(loader_eval)
+        shutdown_data_loader(loader_train)
         cleanup_torch_distributed()
 
 
@@ -1787,7 +2231,110 @@ def cleanup_torch_distributed() -> None:
         return
 
     if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
+        backend = None
+        try:
+            try:
+                backend = dist.get_backend()
+            except Exception:
+                backend = None
+            current_device = None
+            if torch.cuda.is_available():
+                try:
+                    current_device = torch.cuda.current_device()
+                except Exception:
+                    current_device = None
+            if backend == "nccl" and current_device is not None:
+                dist.barrier(device_ids=[current_device])
+            else:
+                dist.barrier()
+        except Exception as exc:
+            print(f"[qat_launch] warning: dist.barrier() before destroy_process_group failed: {exc}", flush=True)
+        if backend == "nccl":
+            print("[qat_launch] skip dist.destroy_process_group() for NCCL to avoid teardown hang on process exit", flush=True)
+            return
+        try:
+            dist.destroy_process_group()
+        except Exception as exc:
+            print(f"[qat_launch] warning: dist.destroy_process_group() failed: {exc}", flush=True)
+
+
+def _close_dataset_resources(dataset) -> None:
+    if dataset is None:
+        return
+    seen = set()
+
+    def _close(obj) -> None:
+        if obj is None or id(obj) in seen:
+            return
+        seen.add(id(obj))
+
+        file_handles = getattr(obj, "_file_handles", None)
+        if isinstance(file_handles, dict):
+            for handle in list(file_handles.values()):
+                close_fn = getattr(handle, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception as exc:
+                        print(f"[qat_launch] warning: dataset handle close failed: {exc}", flush=True)
+            try:
+                file_handles.clear()
+            except Exception:
+                pass
+
+        close_fn = getattr(obj, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+        nested = getattr(obj, "dataset", None)
+        if nested is not None and nested is not obj:
+            _close(nested)
+
+        nested_datasets = getattr(obj, "datasets", None)
+        if isinstance(nested_datasets, (list, tuple)):
+            for item in nested_datasets:
+                _close(item)
+
+    _close(dataset)
+
+
+def shutdown_data_loader(loader) -> None:
+    if loader is None:
+        return
+
+    seen = set()
+
+    def _shutdown(obj) -> None:
+        if obj is None or id(obj) in seen:
+            return
+        seen.add(id(obj))
+
+        nested_loader = getattr(obj, "loader", None)
+        if nested_loader is not None and nested_loader is not obj:
+            _shutdown(nested_loader)
+        nested_loader = getattr(obj, "_loader", None)
+        if nested_loader is not None and nested_loader is not obj:
+            _shutdown(nested_loader)
+
+        iterator = getattr(obj, "_iterator", None)
+        shutdown_fn = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown_fn):
+            try:
+                shutdown_fn()
+            except Exception as exc:
+                print(f"[qat_launch] warning: dataloader worker shutdown failed: {exc}", flush=True)
+            try:
+                obj._iterator = None
+            except Exception:
+                pass
+
+        dataset = getattr(obj, "dataset", None)
+        _close_dataset_resources(dataset)
+
+    _shutdown(loader)
 
 
 def script_argv_from_command(method: str, command: Sequence[str]) -> List[str]:
@@ -1897,7 +2444,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", dest="weight_decay", type=float)
     parser.add_argument("--warmup-epochs", dest="warmup_epochs", type=int)
     parser.add_argument("--warmup-lr", dest="warmup_lr", type=float)
+    parser.add_argument("--min-lr", dest="min_lr", type=float)
     parser.add_argument("--resume", type=str)
+    parser.add_argument("--no-resume-opt", dest="no_resume_opt", action="store_true")
+    parser.add_argument("--start-epoch", dest="start_epoch", type=int)
     parser.add_argument("--devices", type=str, help="GPU 列表，例如 0,1,2,3")
     parser.add_argument("--nproc-per-node", dest="nproc_per_node", type=int, help="Q-ViT torchrun 进程数；OFQ 也可用来推断 world_size")
     parser.add_argument("--master-port", dest="master_port", type=int, default=29500)
@@ -1941,11 +2491,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--boundary-range", dest="boundary_range", type=float)
     parser.add_argument("--freeze-for-n-epochs", dest="freeze_for_n_epochs", type=int)
     parser.add_argument("--train-scheme", dest="train_scheme", choices=["baseline", "ema_ref_attn_kl"], default=None, help="OFQ 训练方案名")
-    parser.add_argument("--ref-update", dest="ref_update", choices=["ema", "prev_step"], default=None, help="历史参考模型更新方式")
+    parser.add_argument("--ref-update", dest="ref_update", choices=["ema", "prev_step", "fixed"], default=None, help="历史参考模型更新方式")
     parser.add_argument("--ref-momentum", dest="ref_momentum", type=float, default=None, help="EMA refmodel 动量")
     parser.add_argument("--ref-attn-kl-weight", dest="ref_attn_kl_weight", type=float, default=None, help="EMA refmodel attention KL 权重")
-    parser.add_argument("--ref-head-mode", dest="ref_head_mode", choices=["all", "oscillating_top5"], default=None, help="refmodel head 级别接口")
+    parser.add_argument("--ref-attn-loss", dest="ref_attn_loss", choices=["kl_ref", "symmetric_kl", "js"], default=None, help="refmodel attention consistency loss")
+    parser.add_argument("--ref-logit-kl-weight", dest="ref_logit_kl_weight", type=float, default=None, help="refmodel logits KL 权重")
+    parser.add_argument("--ref-logit-kl-temperature", dest="ref_logit_kl_temperature", type=float, default=None, help="refmodel logits KL temperature")
+    parser.add_argument("--teacher-qk-rel-weight", dest="teacher_qk_rel_weight", type=float, default=None, help="FP teacher Q/K relation MSE 权重")
+    parser.add_argument("--teacher-qk-rel-warmup-epochs", dest="teacher_qk_rel_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 FP teacher Q/K relation MSE")
+    parser.add_argument("--ref-head-mode", dest="ref_head_mode", type=str, default=None, help="refmodel head 级别接口: all, oscillating_top5/top10/top15, or custom:layer:head,...")
     parser.add_argument("--ref-warmup-epochs", dest="ref_warmup_epochs", type=int, default=None, help="多少个 epoch 后再启用 refmodel attention KL")
+    parser.add_argument("--anchor-ref-attn-kl-weight", dest="anchor_ref_attn_kl_weight", type=float, default=None, help="固定 anchor refmodel attention KL 权重")
+    parser.add_argument("--anchor-ref-warmup-epochs", dest="anchor_ref_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 anchor refmodel attention KL")
+    parser.add_argument("--teacher-attn-kl-weight", dest="teacher_attn_kl_weight", type=float, default=None, help="FP teacher attention KL 权重")
+    parser.add_argument("--teacher-attn-kl-warmup-epochs", dest="teacher_attn_kl_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 FP teacher attention KL")
+    parser.add_argument("--ref-attn-kl-weight-epoch-overrides", dest="ref_attn_kl_weight_epoch_overrides", type=str, default=None, help="按 epoch 覆盖 prev-step KL 权重，格式 epoch:value,epoch:value")
+    parser.add_argument("--anchor-ref-attn-kl-weight-epoch-overrides", dest="anchor_ref_attn_kl_weight_epoch_overrides", type=str, default=None, help="按 epoch 覆盖 anchor KL 权重，格式 epoch:value,epoch:value")
+    parser.add_argument("--epoch-lr-overrides", dest="epoch_lr_overrides", type=str, default=None, help="按 epoch 固定 LR，格式 epoch:value,epoch:value")
+    parser.add_argument("--quant-only-start-epoch", dest="quant_only_start_epoch", type=int, default=None, help="从该 epoch 起只训练量化和 shift 参数")
+    parser.add_argument("--trainable-policy", dest="trainable_policy", choices=["all", "quant", "head_norm_quant", "head_norm_attn_quant"], default=None, help="quant-only 阶段的可训练参数集合")
+    parser.add_argument("--model-ema", dest="model_ema", action="store_true", help="训练时维护 student 权重 EMA 并保存 .ema checkpoint")
+    parser.add_argument("--model-ema-decay", dest="model_ema_decay", type=float, default=None, help="student 权重 EMA decay")
 
     parser.add_argument("--quantize-downsample", dest="quantize_downsample", type=str2bool, default=True, help="AOQ 是否量化 downsample")
     parser.add_argument("--amp", action="store_true", help="AOQ mixed precision")
