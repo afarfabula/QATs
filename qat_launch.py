@@ -10,6 +10,7 @@ import importlib.util
 import inspect
 import io
 import math
+import functools
 import os
 import shlex
 import sys
@@ -114,6 +115,95 @@ class ImageNetParquetDataset(torch.utils.data.Dataset):
         if self.transform is not None:
             image = self.transform(image)
         return image, target
+
+
+class ImageNetParquetEvalIterableDataset(torch.utils.data.IterableDataset):
+    def __init__(self, root: str, split: str = "validation", transform=None, subset_ratio: float = 1.0, rank: Optional[int] = None, world_size: Optional[int] = None):
+        super().__init__()
+        self.root = root
+        self.split = split
+        self.transform = transform
+        self.subset_ratio = float(subset_ratio)
+        self.rank = rank
+        self.world_size = world_size
+        self.data_dir = os.path.join(root, "data") if os.path.isdir(os.path.join(root, "data")) else root
+        if not os.path.isdir(self.data_dir):
+            raise FileNotFoundError(f"parquet data dir not found: {self.data_dir}")
+
+        self.files = sorted(
+            os.path.join(self.data_dir, f)
+            for f in os.listdir(self.data_dir)
+            if f.startswith(f"{split}-") and f.endswith(".parquet")
+        )
+        if not self.files:
+            raise FileNotFoundError(f"no parquet files for split={split} under {self.data_dir}")
+
+        self._segments = []
+        total_rows = 0
+        for file_idx, path in enumerate(self.files):
+            pf = pq.ParquetFile(path)
+            for rg_idx in range(pf.num_row_groups):
+                rg_rows = pf.metadata.row_group(rg_idx).num_rows
+                self._segments.append((total_rows, total_rows + rg_rows, file_idx, rg_idx))
+                total_rows += rg_rows
+        self._total_rows = total_rows
+        self._apply_subset_ratio()
+
+    def _apply_subset_ratio(self) -> None:
+        if self.subset_ratio <= 0 or self.subset_ratio > 1:
+            raise ValueError(f"subset_ratio must be in (0, 1], got {self.subset_ratio}")
+        if self.subset_ratio < 1:
+            self._total_rows = max(1, int(math.ceil(self._total_rows * self.subset_ratio)))
+            self._segments = [segment for segment in self._segments if segment[0] < self._total_rows]
+
+    def _distributed_context(self):
+        if self.rank is not None and self.world_size is not None:
+            return int(self.rank), int(self.world_size)
+        rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        return rank, world_size
+
+    def _rank_bounds(self) -> Tuple[int, int]:
+        rank, world_size = self._distributed_context()
+        start = self._total_rows * rank // world_size
+        end = self._total_rows * (rank + 1) // world_size
+        return start, end
+
+    def __len__(self):
+        start, end = self._rank_bounds()
+        return max(0, end - start)
+
+    def _iter_rank_segments(self):
+        rank_start, rank_end = self._rank_bounds()
+        info = torch.utils.data.get_worker_info()
+        worker_id = 0 if info is None else info.id
+        num_workers = 1 if info is None else info.num_workers
+        worker_start = rank_start + (rank_end - rank_start) * worker_id // num_workers
+        worker_end = rank_start + (rank_end - rank_start) * (worker_id + 1) // num_workers
+        for seg_start, seg_end, file_idx, rg_idx in self._segments:
+            start = max(seg_start, worker_start)
+            end = min(seg_end, worker_end)
+            if start < end:
+                yield file_idx, rg_idx, start - seg_start, end - seg_start
+
+    def __iter__(self):
+        handles = {}
+        for file_idx, rg_idx, local_start, local_end in self._iter_rank_segments():
+            path = self.files[file_idx]
+            pf = handles.get(path)
+            if pf is None:
+                pf = pq.ParquetFile(path)
+                handles[path] = pf
+            table = pf.read_row_group(rg_idx, columns=["image", "label"])
+            cols = table.to_pydict()
+            images = cols["image"]
+            labels = cols["label"]
+            for idx in range(local_start, local_end):
+                image = Image.open(io.BytesIO(images[idx]["bytes"])).convert("RGB")
+                target = int(labels[idx])
+                if self.transform is not None:
+                    image = self.transform(image)
+                yield image, target
 
 
 class ImageNetParquetIterableDataset(torch.utils.data.IterableDataset):
@@ -482,6 +572,7 @@ def build_ofq(args: argparse.Namespace) -> Tuple[List[str], Path, Dict[str, str]
     append_optional_value(command, "--ref-logit-kl-temperature", args.ref_logit_kl_temperature)
     append_optional_value(command, "--teacher-qk-rel-weight", args.teacher_qk_rel_weight)
     append_optional_value(command, "--teacher-qk-rel-warmup-epochs", args.teacher_qk_rel_warmup_epochs)
+    append_optional_value(command, "--clean-start-target-loss-weight", args.clean_start_target_loss_weight)
     append_optional_value(command, "--ref-head-mode", args.ref_head_mode)
     append_optional_value(command, "--ref-warmup-epochs", args.ref_warmup_epochs)
     append_optional_value(command, "--anchor-ref-attn-kl-weight", args.anchor_ref_attn_kl_weight)
@@ -493,6 +584,8 @@ def build_ofq(args: argparse.Namespace) -> Tuple[List[str], Path, Dict[str, str]
     append_optional_value(command, "--epoch-lr-overrides", args.epoch_lr_overrides)
     append_optional_value(command, "--quant-only-start-epoch", args.quant_only_start_epoch)
     append_optional_value(command, "--trainable-policy", args.trainable_policy)
+    append_optional_value(command, "--trainable-policy-update-overrides", args.trainable_policy_update_overrides)
+    append_optional_value(command, "--trainable-policy-update-mode", args.trainable_policy_update_mode)
     append_optional_flag(command, "--model-ema", args.model_ema)
     append_optional_value(command, "--model-ema-decay", args.model_ema_decay)
 
@@ -588,11 +681,11 @@ def load_ofq_training_module():
     return _OFQ_TRAIN_MODULE
 
 
-def create_dataset_compat(dataset_name, root, split, is_training, batch_size, repeats=0, transform=None, subset_ratio: float = 1.0):
+def create_dataset_compat(dataset_name, root, split, is_training, batch_size, repeats=0, transform=None, subset_ratio: float = 1.0, rank: Optional[int] = None, world_size: Optional[int] = None):
     if dataset_name == "hf-parquet-imagenet":
         if is_training:
             return ImageNetParquetIterableDataset(root=root, split=split, transform=transform, shuffle=True, subset_ratio=subset_ratio)
-        return ImageNetParquetDataset(root=root, split=split, transform=transform, subset_ratio=subset_ratio)
+        return ImageNetParquetEvalIterableDataset(root=root, split=split, transform=transform, subset_ratio=subset_ratio, rank=rank, world_size=world_size)
     return create_dataset(dataset_name, root=root, split=split, is_training=is_training, batch_size=batch_size, repeats=repeats)
 
 
@@ -617,11 +710,17 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--step_checkpoint_warmup_updates", type=int)
     parser.add_argument("--max_step_checkpoints_to_save", type=int)
     parser.add_argument("--collect_attention", action="store_true")
+    parser.add_argument("--setup-alpha-batches", dest="setup_alpha_batches", type=int)
     parser.add_argument("--initial-checkpoint", dest="initial_checkpoint", type=str)
     parser.add_argument("--post-load-alpha", dest="post_load_alpha", action="store_true")
     parser.add_argument("--no-prefetcher", dest="no_prefetcher", action="store_true")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--pin-mem", dest="pin_mem", action="store_true")
+    parser.add_argument("--sync-step-timing", dest="sync_step_timing", action="store_true")
+    parser.add_argument("--static-graph", dest="static_graph", action="store_true")
+    parser.add_argument("--no-gradient-as-bucket-view", dest="gradient_as_bucket_view", action="store_false")
+    parser.add_argument("--compile", dest="compile", action="store_true")
+    parser.add_argument("--compile-mode", dest="compile_mode", type=str)
     parser.add_argument("--channels-last", dest="channels_last", action="store_true")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--aa", type=str)
@@ -643,6 +742,7 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--kd-type", dest="kd_type", type=str)
     parser.add_argument("--qk_reparam_type", type=int)
     parser.add_argument("--warmup-lr", dest="warmup_lr", type=float)
+    parser.add_argument("--scheduler-epochs", dest="scheduler_epochs", type=int)
     parser.add_argument("--min-lr", dest="min_lr", type=float)
     parser.add_argument("--recovery-interval", dest="recovery_interval", type=int)
     parser.add_argument("--checkpoint-hist", dest="checkpoint_hist", type=int)
@@ -659,11 +759,14 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--ref-logit-kl-temperature", dest="ref_logit_kl_temperature", type=float)
     parser.add_argument("--teacher-qk-rel-weight", dest="teacher_qk_rel_weight", type=float)
     parser.add_argument("--teacher-qk-rel-warmup-epochs", dest="teacher_qk_rel_warmup_epochs", type=int)
+    parser.add_argument("--clean-start-target-loss-weight", dest="clean_start_target_loss_weight", type=float)
     parser.add_argument("--ref-attn-kl-weight-epoch-overrides", dest="ref_attn_kl_weight_epoch_overrides", type=str)
     parser.add_argument("--anchor-ref-attn-kl-weight-epoch-overrides", dest="anchor_ref_attn_kl_weight_epoch_overrides", type=str)
     parser.add_argument("--epoch-lr-overrides", dest="epoch_lr_overrides", type=str)
     parser.add_argument("--quant-only-start-epoch", dest="quant_only_start_epoch", type=int)
     parser.add_argument("--trainable-policy", dest="trainable_policy", type=str)
+    parser.add_argument("--trainable-policy-update-overrides", dest="trainable_policy_update_overrides", type=str)
+    parser.add_argument("--trainable-policy-update-mode", dest="trainable_policy_update_mode", type=str)
     parser.add_argument("--model-ema", dest="model_ema", action="store_true")
     parser.add_argument("--model-ema-decay", dest="model_ema_decay", type=float)
     namespace, _ = parser.parse_known_args(list(extra_args))
@@ -688,6 +791,36 @@ def parse_epoch_float_overrides(spec: object) -> Dict[int, float]:
         epoch_text, value_text = item.split(":", 1)
         parsed[int(epoch_text.strip())] = float(value_text.strip())
     return parsed
+
+
+def parse_policy_update_overrides(spec: object) -> Dict[int, str]:
+    if spec is None or spec == "":
+        return {}
+    if isinstance(spec, dict):
+        return {int(k): str(v) for k, v in spec.items()}
+    parsed = {}
+    for item in str(spec).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"policy update override must be update:policy, got {item!r}")
+        update_text, policy_text = item.split(":", 1)
+        policy = policy_text.strip()
+        if policy not in {"all", "quant", "head_norm_quant", "head_norm_attn_quant"}:
+            raise ValueError(f"Unsupported trainable policy override: {policy}")
+        parsed[int(update_text.strip())] = policy
+    return parsed
+
+
+def update_policy_value(overrides: Dict[int, str], update: int, default: str) -> str:
+    active = default
+    for update_idx in sorted(overrides):
+        if update >= update_idx:
+            active = overrides[update_idx]
+        else:
+            break
+    return active
 
 
 def epoch_float_value(overrides: Dict[int, float], epoch: int, default: float) -> float:
@@ -744,11 +877,17 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "subset_ratio": 1.0,
         "save_images": False,
         "amp": False,
+        "amp_dtype": "bf16",
         "apex_amp": False,
         "native_amp": False,
         "channels_last": False,
         "pin_mem": False,
         "no_prefetcher": False,
+        "sync_step_timing": False,
+        "static_graph": False,
+        "gradient_as_bucket_view": True,
+        "compile": False,
+        "compile_mode": "reduce-overhead",
         "output": str((ROOT / "outputs" / "ofq").resolve()),
         "experiment": None,
         "eval_metric": "top1",
@@ -784,6 +923,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "visible_gpu": args.devices or "0",
         "tcp_port": str(args.master_port),
         "collect_attention": False,
+        "setup_alpha_batches": 1,
         "max_train_updates": 0,
         "save_step_checkpoints": False,
         "save_initial_step_checkpoint": False,
@@ -809,6 +949,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "ref_logit_kl_temperature": 2.0,
         "teacher_qk_rel_weight": 0.0,
         "teacher_qk_rel_warmup_epochs": 0,
+        "clean_start_target_loss_weight": 0.0,
         "ref_head_mode": "all",
         "ref_warmup_epochs": 0,
         "anchor_ref_attn_kl_weight": 0.0,
@@ -820,6 +961,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "epoch_lr_overrides": "",
         "quant_only_start_epoch": None,
         "trainable_policy": "all",
+        "trainable_policy_update_overrides": "",
+        "trainable_policy_update_mode": "requires_grad",
         "model_ema": False,
         "model_ema_decay": 0.9999,
         "initial_checkpoint": "",
@@ -831,11 +974,13 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "weight_decay": 0.0,
         "epochs": 300,
         "warmup_epochs": 0,
+        "scheduler_epochs": None,
         "min_lr": 1e-5,
         "workers": 4,
         "batch_size": 32,
         "validation_batch_size_multiplier": 1,
         "grad_accum_steps": 1,
+        "forward_micro_batch_size": 0,
         "momentum": 0.9,
         "opt_betas": (0.9, 0.999),
         "clip_grad": None,
@@ -879,6 +1024,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["warmup_epochs"] = args.warmup_epochs
     if args.warmup_lr is not None:
         defaults["warmup_lr"] = args.warmup_lr
+    if args.scheduler_epochs is not None:
+        defaults["scheduler_epochs"] = args.scheduler_epochs
     if args.min_lr is not None:
         defaults["min_lr"] = args.min_lr
     if args.no_resume_opt:
@@ -887,6 +1034,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["start_epoch"] = args.start_epoch
     if args.grad_accum_steps is not None:
         defaults["grad_accum_steps"] = args.grad_accum_steps
+    if args.forward_micro_batch_size is not None:
+        defaults["forward_micro_batch_size"] = args.forward_micro_batch_size
     if args.checkpoint_hist is not None:
         defaults["checkpoint_hist"] = args.checkpoint_hist
     if args.epoch_checkpoint_interval is not None:
@@ -939,6 +1088,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["teacher_qk_rel_weight"] = args.teacher_qk_rel_weight
     if args.teacher_qk_rel_warmup_epochs is not None:
         defaults["teacher_qk_rel_warmup_epochs"] = args.teacher_qk_rel_warmup_epochs
+    if args.clean_start_target_loss_weight is not None:
+        defaults["clean_start_target_loss_weight"] = args.clean_start_target_loss_weight
     if args.ref_head_mode is not None:
         defaults["ref_head_mode"] = args.ref_head_mode
     if args.ref_warmup_epochs is not None:
@@ -957,14 +1108,31 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["anchor_ref_attn_kl_weight_epoch_overrides"] = args.anchor_ref_attn_kl_weight_epoch_overrides
     if args.epoch_lr_overrides is not None:
         defaults["epoch_lr_overrides"] = args.epoch_lr_overrides
+    if args.setup_alpha_batches is not None:
+        defaults["setup_alpha_batches"] = args.setup_alpha_batches
     if args.quant_only_start_epoch is not None:
         defaults["quant_only_start_epoch"] = args.quant_only_start_epoch
     if args.trainable_policy is not None:
         defaults["trainable_policy"] = args.trainable_policy
+    if args.trainable_policy_update_overrides is not None:
+        defaults["trainable_policy_update_overrides"] = args.trainable_policy_update_overrides
+    if args.trainable_policy_update_mode is not None:
+        defaults["trainable_policy_update_mode"] = args.trainable_policy_update_mode
     if args.model_ema:
         defaults["model_ema"] = True
     if args.model_ema_decay is not None:
         defaults["model_ema_decay"] = args.model_ema_decay
+    if args.amp:
+        defaults["amp"] = True
+        defaults["native_amp"] = True
+    if args.amp_dtype is not None:
+        defaults["amp_dtype"] = args.amp_dtype
+    if args.channels_last:
+        defaults["channels_last"] = True
+    if args.compile:
+        defaults["compile"] = True
+    if args.compile_mode is not None:
+        defaults["compile_mode"] = args.compile_mode
 
     defaults.update(build_ofq_runtime_overrides(args.extra_arg))
     defaults["aa"] = normalize_optional_string(defaults.get("aa"))
@@ -978,9 +1146,13 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["batch_size"] = int(defaults["batch_size"])
     defaults["workers"] = int(defaults["workers"])
     defaults["grad_accum_steps"] = int(defaults["grad_accum_steps"])
+    defaults["forward_micro_batch_size"] = int(defaults.get("forward_micro_batch_size", 0) or 0)
     defaults["warmup_epochs"] = int(defaults["warmup_epochs"])
+    if defaults.get("scheduler_epochs") is not None:
+        defaults["scheduler_epochs"] = int(defaults["scheduler_epochs"])
     defaults["num_classes"] = int(defaults["num_classes"])
     defaults["epoch_checkpoint_interval"] = int(defaults["epoch_checkpoint_interval"])
+    defaults["setup_alpha_batches"] = int(defaults.get("setup_alpha_batches", 1))
     defaults["subset_ratio"] = float(defaults["subset_ratio"])
     defaults["ref_warmup_epochs"] = int(defaults["ref_warmup_epochs"])
     if defaults.get("start_epoch") is not None:
@@ -992,6 +1164,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["ref_logit_kl_temperature"] = float(defaults["ref_logit_kl_temperature"])
     defaults["teacher_qk_rel_weight"] = float(defaults["teacher_qk_rel_weight"])
     defaults["teacher_qk_rel_warmup_epochs"] = int(defaults["teacher_qk_rel_warmup_epochs"])
+    defaults["clean_start_target_loss_weight"] = float(defaults.get("clean_start_target_loss_weight", 0.0))
     defaults["anchor_ref_attn_kl_weight"] = float(defaults["anchor_ref_attn_kl_weight"])
     defaults["anchor_ref_warmup_epochs"] = int(defaults["anchor_ref_warmup_epochs"])
     defaults["teacher_attn_kl_weight"] = float(defaults["teacher_attn_kl_weight"])
@@ -999,6 +1172,10 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     if defaults.get("quant_only_start_epoch") is not None:
         defaults["quant_only_start_epoch"] = int(defaults["quant_only_start_epoch"])
     defaults["trainable_policy"] = str(defaults.get("trainable_policy") or "all")
+    defaults["trainable_policy_update_overrides"] = parse_policy_update_overrides(defaults.get("trainable_policy_update_overrides"))
+    defaults["trainable_policy_update_mode"] = str(defaults.get("trainable_policy_update_mode") or "requires_grad")
+    if defaults["trainable_policy_update_mode"] not in {"requires_grad", "grad_mask"}:
+        raise ValueError(f"Unsupported trainable_policy_update_mode: {defaults['trainable_policy_update_mode']}")
     defaults["ref_attn_kl_weight_epoch_overrides"] = parse_epoch_float_overrides(defaults.get("ref_attn_kl_weight_epoch_overrides"))
     defaults["anchor_ref_attn_kl_weight_epoch_overrides"] = parse_epoch_float_overrides(defaults.get("anchor_ref_attn_kl_weight_epoch_overrides"))
     defaults["epoch_lr_overrides"] = parse_epoch_float_overrides(defaults.get("epoch_lr_overrides"))
@@ -1006,6 +1183,17 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["model_ema_decay"] = float(defaults.get("model_ema_decay", 0.9999))
     defaults["no_prefetcher"] = bool(defaults.get("no_prefetcher", False))
     defaults["prefetcher"] = not defaults["no_prefetcher"]
+    defaults["sync_step_timing"] = bool(defaults.get("sync_step_timing", False))
+    defaults["static_graph"] = bool(defaults.get("static_graph", False))
+    defaults["gradient_as_bucket_view"] = bool(defaults.get("gradient_as_bucket_view", True))
+    defaults["compile"] = bool(defaults.get("compile", False))
+    defaults["compile_mode"] = str(defaults.get("compile_mode") or "reduce-overhead")
+    defaults["amp"] = bool(defaults.get("amp", False))
+    defaults["native_amp"] = bool(defaults.get("native_amp", False) or defaults["amp"])
+    defaults["amp_dtype"] = str(defaults.get("amp_dtype") or "bf16").lower()
+    if defaults["amp_dtype"] not in {"bf16", "fp16"}:
+        raise ValueError(f"OFQ amp_dtype must be bf16 or fp16, got {defaults['amp_dtype']!r}")
+    defaults["channels_last"] = bool(defaults.get("channels_last", False))
     defaults["teacher"] = defaults["teacher"] or defaults["model"]
     defaults["experiment"] = defaults["experiment"] or safe_model_name(defaults["model"])
     defaults["opt_betas"] = tuple(defaults.get("opt_betas") or (0.9, 0.999))
@@ -1015,7 +1203,9 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["single_process_effective_batch_size"] = defaults["batch_size"] * defaults["single_process_grad_accum_steps"]
     if defaults["world_size"] > 1:
         defaults["grad_accum_steps"] = max(1, int(math.ceil(defaults["single_process_grad_accum_steps"] / defaults["world_size"])))
-    defaults["effective_batch_size"] = defaults["batch_size"] * defaults["world_size"] * defaults["grad_accum_steps"]
+    if defaults.get("forward_micro_batch_size", 0) > 0 and defaults["forward_micro_batch_size"] < defaults["batch_size"]:
+        defaults["grad_accum_steps"] = max(defaults["grad_accum_steps"], int(math.ceil(defaults["batch_size"] / defaults["forward_micro_batch_size"])))
+    defaults["effective_batch_size"] = defaults["batch_size"] * defaults["world_size"]
 
     return SimpleNamespace(**defaults)
 
@@ -1098,6 +1288,8 @@ def create_ofq_teacher_model(runtime_args: SimpleNamespace) -> nn.Module:
         load_checkpoint(teacher, runtime_args.teacher_checkpoint, strict=True)
     if runtime_args.teacher_attn_kl_weight > 0 or runtime_args.teacher_qk_rel_weight > 0:
         set_attention_mode(teacher, collect_attention=True, qqkkvv=qqkkvv)
+    for param in teacher.parameters():
+        param.requires_grad_(False)
     return teacher
 
 
@@ -1258,6 +1450,27 @@ def set_trainable_policy(model: nn.Module, policy: str) -> Tuple[int, int]:
         else:
             frozen += param.numel()
     return trainable, frozen
+
+
+def parameter_matches_trainable_policy(name: str, policy: str) -> bool:
+    policy = str(policy or "all")
+    if policy == "all":
+        return True
+    if policy == "quant":
+        return is_quant_or_shift_parameter(name)
+    if policy == "head_norm_quant":
+        return is_quant_or_shift_parameter(name) or is_head_norm_parameter(name)
+    if policy == "head_norm_attn_quant":
+        return is_quant_or_shift_parameter(name) or is_head_norm_parameter(name) or is_attention_projection_parameter(name)
+    raise ValueError(f"Unsupported trainable policy: {policy}")
+
+
+def apply_gradient_mask_policy(model: nn.Module, policy: str) -> None:
+    if str(policy or "all") == "all":
+        return
+    for name, param in maybe_unwrap_ddp(model).named_parameters():
+        if param.grad is not None and not parameter_matches_trainable_policy(name, policy):
+            param.grad = None
 
 
 def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
@@ -1421,10 +1634,11 @@ def teacher_qk_relation_loss(student_attn_info, teacher_attn_info) -> torch.Tens
 
 def setup_alpha(model: nn.Module, loader, runtime_args: SimpleNamespace, amp_autocast):
     model.eval()
+    setup_batches = max(1, int(getattr(runtime_args, "setup_alpha_batches", 1)))
     if runtime_args.local_rank == 0:
-        print("setup alpha")
+        print(f"setup alpha batches={setup_batches}")
     with torch.no_grad():
-        for input, target in loader:
+        for batch_idx, (input, target) in enumerate(loader):
             if not runtime_args.prefetcher:
                 input = input.cuda(non_blocking=True)
                 target = target.cuda(non_blocking=True)
@@ -1432,7 +1646,8 @@ def setup_alpha(model: nn.Module, loader, runtime_args: SimpleNamespace, amp_aut
                 input = input.contiguous(memory_format=torch.channels_last)
             with amp_autocast():
                 model(input)
-            break
+            if batch_idx + 1 >= setup_batches:
+                break
 
 
 def create_ofq_loss(runtime_args: SimpleNamespace):
@@ -1460,7 +1675,7 @@ def create_ofq_loss(runtime_args: SimpleNamespace):
 def create_ofq_optimizer(runtime_args: SimpleNamespace, model: nn.Module) -> torch.optim.Optimizer:
     if runtime_args.opt.lower() != "adamw":
         raise NotImplementedError(f"当前 unified OFQ path 仅支持 AdamW，收到: {runtime_args.opt}")
-    return torch.optim.AdamW(model.parameters(), lr=runtime_args.lr, weight_decay=runtime_args.weight_decay, betas=runtime_args.opt_betas)
+    return torch.optim.AdamW(model.parameters(), lr=runtime_args.lr, weight_decay=runtime_args.weight_decay, betas=runtime_args.opt_betas, fused=True)
 
 
 class WarmupCosineScheduler:
@@ -1485,14 +1700,16 @@ class WarmupCosineScheduler:
 
 def validate_ofq(model: nn.Module, loader, loss_fn, runtime_args: SimpleNamespace, amp_autocast):
     batch_time_m = AverageMeter()
-    losses_m = AverageMeter()
-    top1_m = AverageMeter()
-    top5_m = AverageMeter()
     model.eval()
     if runtime_args.local_rank == 0:
         print("model eval")
-    end = time.time()
+    local_start_time = time.time()
+    end = local_start_time
     last_idx = len(loader) - 1
+    local_loss_sum = 0.0
+    local_top1_correct = 0.0
+    local_top5_correct = 0.0
+    local_samples = 0.0
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(loader):
             last_batch = batch_idx == last_idx
@@ -1510,28 +1727,138 @@ def validate_ofq(model: nn.Module, loader, loss_fn, runtime_args: SimpleNamespac
                 output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
                 target = target[0 : target.size(0) : reduce_factor]
             loss = loss_fn(output, target)
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            if runtime_args.distributed:
-                reduced_loss = reduce_tensor(loss.data, runtime_args.world_size)
-                acc1 = reduce_tensor(acc1, runtime_args.world_size)
-                acc5 = reduce_tensor(acc5, runtime_args.world_size)
-            else:
-                reduced_loss = loss.data
-            torch.cuda.synchronize()
-            losses_m.update(reduced_loss.item(), input.size(0))
-            top1_m.update(acc1.item(), output.size(0))
-            top5_m.update(acc5.item(), output.size(0))
+            batch_size = float(output.size(0))
+            _, pred = output.topk(5, 1, True, True)
+            pred = pred.t()
+            correct = pred.eq(target.reshape(1, -1).expand_as(pred))
+            local_loss_sum += float(loss.detach().item()) * batch_size
+            local_top1_correct += float(correct[:1].reshape(-1).float().sum().item())
+            local_top5_correct += float(correct[:5].reshape(-1).float().sum().item())
+            local_samples += batch_size
             batch_time_m.update(time.time() - end)
             end = time.time()
             if runtime_args.local_rank == 0 and (last_batch or batch_idx % runtime_args.log_interval == 0):
+                local_loss = local_loss_sum / max(local_samples, 1.0)
+                local_top1 = 100.0 * local_top1_correct / max(local_samples, 1.0)
+                local_top5 = 100.0 * local_top5_correct / max(local_samples, 1.0)
                 print(
-                    f"Test: [{batch_idx:>4d}/{last_idx}]  Time: {batch_time_m.val:.3f} ({batch_time_m.avg:.3f})  "
-                    f"Loss: {losses_m.val:>7.4f} ({losses_m.avg:>6.4f})  "
-                    f"Acc@1: {top1_m.val:>7.4f} ({top1_m.avg:>7.4f})  "
-                    f"Acc@5: {top5_m.val:>7.4f} ({top5_m.avg:>7.4f})"
+                    f"TestLocal: [{batch_idx:>4d}/{last_idx}]  Time: {batch_time_m.val:.3f} ({batch_time_m.avg:.3f})  "
+                    f"Loss: {local_loss:>7.4f}  Acc@1: {local_top1:>7.4f}  "
+                    f"Acc@5: {local_top5:>7.4f}  Samples: {int(local_samples)}"
                 )
-    return {"loss": losses_m.avg, "top1": top1_m.avg, "top5": top5_m.avg}
 
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    local_wall = time.time() - local_start_time
+    device = torch.device(runtime_args.device if torch.cuda.is_available() else "cpu")
+    stats = torch.tensor(
+        [local_loss_sum, local_top1_correct, local_top5_correct, local_samples, local_wall],
+        dtype=torch.float64,
+        device=device,
+    )
+    gathered_counts = None
+    if runtime_args.distributed:
+        if runtime_args.local_rank == 0:
+            gathered_counts = [torch.zeros(1, dtype=torch.float64, device=device) for _ in range(runtime_args.world_size)]
+        dist.gather(stats[3:4], gather_list=gathered_counts, dst=0)
+        dist.all_reduce(stats[:4], op=dist.ReduceOp.SUM)
+        wall_tensor = stats[4:5].clone()
+        dist.all_reduce(wall_tensor, op=dist.ReduceOp.MAX)
+        global_wall = float(wall_tensor.item())
+    else:
+        gathered_counts = [stats[3:4].clone()]
+        global_wall = local_wall
+
+    global_samples = max(float(stats[3].item()), 1.0)
+    metrics = {
+        "loss": float(stats[0].item() / global_samples),
+        "top1": float(100.0 * stats[1].item() / global_samples),
+        "top5": float(100.0 * stats[2].item() / global_samples),
+        "samples": int(stats[3].item()),
+        "local_samples": int(local_samples),
+        "wall_seconds": global_wall,
+    }
+    if runtime_args.local_rank == 0:
+        rank_counts = [int(t.item()) for t in gathered_counts] if gathered_counts is not None else [int(local_samples)]
+        print(
+            f"Test: [distributed-summary]  Time: {global_wall:.3f}s  "
+            f"Loss: {metrics['loss']:.4f}  Acc@1: {metrics['top1']:.4f}  "
+            f"Acc@5: {metrics['top5']:.4f}  Samples: {metrics['samples']}  "
+            f"RankSamples: {rank_counts}"
+        )
+    return metrics
+
+
+def compute_ofq_batch_loss(input, target, model: nn.Module, loss_fn, runtime_args: SimpleNamespace, amp_autocast, teacher: Optional[nn.Module], ref_model: Optional[nn.Module], anchor_ref_model: Optional[nn.Module], ref_attn_kl_weight: float, anchor_ref_attn_kl_weight: float):
+    with amp_autocast():
+        if runtime_args.model_type in {"deit", "swin"}:
+            student_output = model(input)
+            if isinstance(student_output, tuple):
+                student_logit = student_output[0]
+                student_attn_info = student_output[1] if len(student_output) > 1 else None
+            else:
+                student_logit = student_output
+                student_attn_info = None
+        else:
+            student_logit = model(input)
+            student_attn_info = None
+
+        if runtime_args.use_kd:
+            with torch.no_grad():
+                teacher_output = teacher(input)
+            if isinstance(teacher_output, tuple):
+                teacher_logit = teacher_output[0]
+                teacher_attn_info = teacher_output[1] if len(teacher_output) > 1 else None
+            else:
+                teacher_logit = teacher_output
+                teacher_attn_info = None
+            if runtime_args.kd_hard_and_soft == 0:
+                loss = loss_fn(student_logit, teacher_logit)
+            elif runtime_args.kd_hard_and_soft == 1:
+                loss = loss_fn(student_logit, target, teacher_logit)
+            elif runtime_args.kd_hard_and_soft == 2:
+                loss = loss_fn(student_logit, student_attn_info, target, teacher_logit, teacher_attn_info)
+            elif runtime_args.kd_hard_and_soft == 3:
+                loss = loss_fn(student_logit, student_attn_info, target, teacher_logit, teacher_attn_info)
+            else:
+                raise NotImplementedError(f"Unsupported kd_hard_and_soft={runtime_args.kd_hard_and_soft}")
+            if runtime_args.clean_start_target_loss_weight > 0:
+                student_logit_for_ce = student_logit[0] if isinstance(student_logit, tuple) else student_logit
+                loss = loss + runtime_args.clean_start_target_loss_weight * F.cross_entropy(student_logit_for_ce, target)
+        else:
+            student_logit = student_logit[0] if isinstance(student_logit, tuple) else student_logit
+            loss = loss_fn(student_logit, target)
+
+        base_loss_for_log = loss.detach()
+        ref_attn_kl_loss = loss.new_zeros(())
+        ref_logit_kl_loss = loss.new_zeros(())
+        anchor_ref_attn_kl_loss = loss.new_zeros(())
+        teacher_attn_kl_loss = loss.new_zeros(())
+        teacher_qk_rel_loss = loss.new_zeros(())
+        use_ref_scheme = (
+            runtime_args.train_scheme == "ema_ref_attn_kl"
+            and ref_model is not None
+            and (ref_attn_kl_weight > 0 or runtime_args.ref_logit_kl_weight > 0)
+        )
+        if use_ref_scheme:
+            with torch.no_grad():
+                ref_logits, ref_attn_info = ref_model(input)
+            if ref_attn_kl_weight > 0:
+                ref_attn_kl_loss = attention_kl_consistency_loss(
+                    student_attn_info,
+                    ref_attn_info,
+                    head_mode=runtime_args.ref_head_mode,
+                    loss_type=runtime_args.ref_attn_loss,
+                )
+                loss = loss + ref_attn_kl_weight * ref_attn_kl_loss
+            if runtime_args.ref_logit_kl_weight > 0:
+                ref_logit_kl_loss = logits_kl_consistency_loss(
+                    student_logit,
+                    ref_logits,
+                    temperature=runtime_args.ref_logit_kl_temperature,
+                )
+                loss = loss + runtime_args.ref_logit_kl_weight * ref_logit_kl_loss
+        return loss, base_loss_for_log, ref_attn_kl_loss.detach(), ref_logit_kl_loss.detach(), anchor_ref_attn_kl_loss.detach(), teacher_attn_kl_loss.detach(), teacher_qk_rel_loss.detach()
 
 def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.optim.Optimizer, loss_fn, runtime_args: SimpleNamespace, lr_scheduler: WarmupCosineScheduler, output_dir: Path, amp_autocast, loss_scaler, teacher: Optional[nn.Module], mixup_fn, ref_model: Optional[nn.Module] = None, anchor_ref_model: Optional[nn.Module] = None, model_ema: Optional[nn.Module] = None):
     if runtime_args.mixup_off_epoch and epoch >= runtime_args.mixup_off_epoch:
@@ -1562,19 +1889,33 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
         runtime_args.anchor_ref_attn_kl_weight,
     )
     model.train()
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
     end = time.time()
     last_idx = len(loader) - 1
     num_updates = epoch * len(loader)
     local_update_count = 0
     saved_step_count = 0
     stopped_early = False
+    current_trainable_policy = None
     warmup_updates = max(0, int(getattr(runtime_args, "step_checkpoint_warmup_updates", 0)))
     max_step_checkpoints_to_save = max(0, int(getattr(runtime_args, "max_step_checkpoints_to_save", 0)))
 
     for batch_idx, (input, target) in enumerate(loader):
         last_batch = batch_idx == last_idx
         update_step = ((batch_idx + 1) % accum_steps == 0) or last_batch
+        desired_policy = update_policy_value(runtime_args.trainable_policy_update_overrides, local_update_count, runtime_args.trainable_policy)
+        if desired_policy != current_trainable_policy:
+            if runtime_args.trainable_policy_update_mode == "requires_grad":
+                trainable_params, frozen_params = set_trainable_policy(model, desired_policy)
+            else:
+                trainable_params, frozen_params = set_trainable_policy(model, "all")
+            current_trainable_policy = desired_policy
+            if runtime_args.local_rank == 0:
+                print(
+                    f"Trainable parameter update policy: epoch={epoch}, update={local_update_count}, "
+                    f"mode={runtime_args.trainable_policy_update_mode}, policy={desired_policy}, "
+                    f"trainable={trainable_params}, frozen={frozen_params}"
+                )
         data_time_m.update(time.time() - end)
         if not runtime_args.prefetcher:
             input = input.cuda(non_blocking=True)
@@ -1591,16 +1932,24 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
         with sync_context:
             with amp_autocast():
                 if runtime_args.model_type in {"deit", "swin"}:
-                    student_logit, student_attn_info = model(input)
+                    student_output = model(input)
+                    if isinstance(student_output, tuple):
+                        student_logit = student_output[0]
+                        student_attn_info = student_output[1] if len(student_output) > 1 else None
+                    else:
+                        student_logit = student_output
+                        student_attn_info = None
                 else:
                     student_logit = model(input)
                     student_attn_info = None
 
+                teacher_attn_info = None
                 if runtime_args.use_kd:
-                    if runtime_args.teacher_type in {"deit", "swin"}:
-                        teacher_output = teacher(input)
-                    else:
-                        teacher_output = teacher(input)
+                    with torch.no_grad():
+                        if runtime_args.teacher_type in {"deit", "swin"}:
+                            teacher_output = teacher(input)
+                        else:
+                            teacher_output = teacher(input)
                     if isinstance(teacher_output, tuple):
                         teacher_logit = teacher_output[0]
                         teacher_attn_info = teacher_output[1] if len(teacher_output) > 1 else None
@@ -1618,6 +1967,9 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                         loss = loss_fn(student_logit, student_attn_info, target, teacher_logit, teacher_attn_info)
                     else:
                         raise NotImplementedError(f"Unsupported kd_hard_and_soft={runtime_args.kd_hard_and_soft}")
+                    if runtime_args.clean_start_target_loss_weight > 0:
+                        student_logit_for_ce = student_logit[0] if isinstance(student_logit, tuple) else student_logit
+                        loss = loss + runtime_args.clean_start_target_loss_weight * F.cross_entropy(student_logit_for_ce, target)
                 else:
                     student_logit = student_logit[0] if isinstance(student_logit, tuple) else student_logit
                     loss = loss_fn(student_logit, target)
@@ -1729,12 +2081,14 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
             else:
                 scaled_loss.backward(create_graph=second_order)
                 if update_step:
+                    if runtime_args.trainable_policy_update_mode == "grad_mask":
+                        apply_gradient_mask_policy(model, current_trainable_policy)
                     if runtime_args.clip_grad is not None:
                         dispatch_clip_grad(model_parameters(model, exclude_head="agc" in runtime_args.clip_mode), value=runtime_args.clip_grad, mode=runtime_args.clip_mode)
                     optimizer.step()
 
         if update_step:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             local_update_count += 1
             if model_ema is not None:
                 update_model_ema(model, model_ema, runtime_args.model_ema_decay)
@@ -1756,7 +2110,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 elif local_update_count % interval == 0:
                     save_step_checkpoint(model, optimizer, runtime_args, output_dir, f"step_{local_update_count:04d}", epoch=epoch, batch_idx=batch_idx, loss_scaler=loss_scaler)
 
-        torch.cuda.synchronize()
+        if runtime_args.sync_step_timing:
+            torch.cuda.synchronize()
         if update_step:
             num_updates += 1
             lr_scheduler.step_update(num_updates)
@@ -1798,6 +2153,15 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
             stopped_early = True
             break
         end = time.time()
+
+    if runtime_args.local_rank == 0:
+        samples_per_step = runtime_args.batch_size * runtime_args.world_size
+        throughput = samples_per_step / batch_time_m.avg if batch_time_m.avg > 0 else 0.0
+        print(
+            f"TrainSummary: epoch={epoch} updates={local_update_count} "
+            f"avg_step_time={batch_time_m.avg:.6f}s "
+            f"samples_per_step={samples_per_step} samples_per_sec={throughput:.2f}"
+        )
 
     return {"loss": losses_m.avg}, local_update_count, stopped_early
 
@@ -1845,10 +2209,18 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
     model.cuda()
     if runtime_args.channels_last:
         model = model.to(memory_format=torch.channels_last)
+    if runtime_args.compile:
+        if runtime_args.local_rank == 0:
+            print(f"Compiling OFQ model with torch.compile mode={runtime_args.compile_mode}")
+        model = torch.compile(model, mode=runtime_args.compile_mode)
 
     use_amp = bool(runtime_args.amp or runtime_args.native_amp)
-    amp_autocast = torch.cuda.amp.autocast if use_amp else contextlib.suppress
-    loss_scaler = NativeScaler() if use_amp else None
+    amp_dtype = torch.bfloat16 if runtime_args.amp_dtype == "bf16" else torch.float16
+    amp_autocast = functools.partial(torch.amp.autocast, "cuda", dtype=amp_dtype) if use_amp else contextlib.suppress
+    loss_scaler = NativeScaler() if use_amp and amp_dtype is torch.float16 else None
+    if runtime_args.local_rank == 0 and use_amp:
+        scaler_state = "enabled" if loss_scaler is not None else "disabled"
+        print(f"Using OFQ CUDA AMP dtype={runtime_args.amp_dtype}, loss_scaler={scaler_state}")
 
     data_config = resolve_data_config(vars(runtime_args), model=model, verbose=runtime_args.local_rank == 0)
     if runtime_args.eval_only:
@@ -1903,6 +2275,8 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
             is_training=False,
             batch_size=runtime_args.batch_size,
             subset_ratio=runtime_args.subset_ratio,
+            rank=runtime_args.rank,
+            world_size=runtime_args.world_size,
         )
         loader_eval = create_loader_compat(
             dataset_eval,
@@ -1964,10 +2338,18 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
         dataset_train = AugMixDataset(dataset_train, num_splits=runtime_args.aug_splits)
 
     train_interpolation = runtime_args.train_interpolation or data_config["interpolation"]
+    train_loader_batch_size = runtime_args.batch_size
+    if runtime_args.forward_micro_batch_size > 0 and runtime_args.forward_micro_batch_size < runtime_args.batch_size:
+        train_loader_batch_size = runtime_args.forward_micro_batch_size
+        if runtime_args.local_rank == 0:
+            print(
+                f"Using forward micro-batch: loader_batch_size={train_loader_batch_size}, "
+                f"grad_accum_steps={runtime_args.grad_accum_steps}, effective_per_gpu_batch={runtime_args.batch_size}"
+            )
     loader_train = create_loader_compat(
         dataset_train,
         input_size=data_config["input_size"],
-        batch_size=runtime_args.batch_size,
+        batch_size=train_loader_batch_size,
         is_training=True,
         use_prefetcher=runtime_args.prefetcher,
         no_aug=False,
@@ -2004,6 +2386,8 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
             is_training=False,
             batch_size=runtime_args.batch_size,
             subset_ratio=runtime_args.subset_ratio,
+            rank=runtime_args.rank,
+            world_size=runtime_args.world_size,
         )
         loader_eval = create_loader_compat(
             dataset_eval,
@@ -2038,6 +2422,8 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
             model,
             device_ids=[local_rank],
             find_unused_parameters=runtime_args.quant_only_start_epoch is not None,
+            static_graph=runtime_args.static_graph,
+            gradient_as_bucket_view=runtime_args.gradient_as_bucket_view,
         )
 
     ref_model = None
@@ -2069,7 +2455,7 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
         base_lr=runtime_args.lr,
         min_lr=runtime_args.min_lr,
         warmup_updates=runtime_args.warmup_epochs * updates_per_epoch,
-        total_updates=runtime_args.epochs * updates_per_epoch,
+        total_updates=(runtime_args.scheduler_epochs or runtime_args.epochs) * updates_per_epoch,
     )
     if start_epoch > 0:
         lr_scheduler.step_update(start_epoch * updates_per_epoch)
@@ -2079,10 +2465,10 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
         print(f"Scheduled epochs: {runtime_args.epochs}")
         print(
             "Effective batch alignment: "
-            f"single-process batch={runtime_args.batch_size} x accum={runtime_args.single_process_grad_accum_steps} "
-            f"= {runtime_args.single_process_effective_batch_size}; "
-            f"distributed batch={runtime_args.batch_size} x world_size={runtime_args.world_size} x accum={runtime_args.grad_accum_steps} "
-            f"= {runtime_args.effective_batch_size}"
+            f"per_gpu_effective_batch={runtime_args.batch_size}, "
+            f"loader_batch={runtime_args.forward_micro_batch_size if runtime_args.forward_micro_batch_size > 0 else runtime_args.batch_size}, "
+            f"accum={runtime_args.grad_accum_steps}, world_size={runtime_args.world_size}, "
+            f"global_effective_batch={runtime_args.effective_batch_size}"
         )
 
     train_loss_fn = create_ofq_loss(runtime_args)
@@ -2439,11 +2825,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", dest="batch_size", type=int)
     parser.add_argument("--batch-size-eval", dest="batch_size_eval", type=int)
+    parser.add_argument("--forward-micro-batch-size", dest="forward_micro_batch_size", type=int, default=None, help="split each train batch into micro forwards with gradient accumulation")
     parser.add_argument("--workers", type=int)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--weight-decay", dest="weight_decay", type=float)
     parser.add_argument("--warmup-epochs", dest="warmup_epochs", type=int)
     parser.add_argument("--warmup-lr", dest="warmup_lr", type=float)
+    parser.add_argument("--scheduler-epochs", dest="scheduler_epochs", type=int)
     parser.add_argument("--min-lr", dest="min_lr", type=float)
     parser.add_argument("--resume", type=str)
     parser.add_argument("--no-resume-opt", dest="no_resume_opt", action="store_true")
@@ -2499,24 +2887,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ref-logit-kl-temperature", dest="ref_logit_kl_temperature", type=float, default=None, help="refmodel logits KL temperature")
     parser.add_argument("--teacher-qk-rel-weight", dest="teacher_qk_rel_weight", type=float, default=None, help="FP teacher Q/K relation MSE 权重")
     parser.add_argument("--teacher-qk-rel-warmup-epochs", dest="teacher_qk_rel_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 FP teacher Q/K relation MSE")
+    parser.add_argument("--clean-start-target-loss-weight", dest="clean_start_target_loss_weight", type=float, default=None, help="early stage clean-start hard-label CE auxiliary weight for KD runs")
     parser.add_argument("--ref-head-mode", dest="ref_head_mode", type=str, default=None, help="refmodel head 级别接口: all, oscillating_top5/top10/top15, or custom:layer:head,...")
     parser.add_argument("--ref-warmup-epochs", dest="ref_warmup_epochs", type=int, default=None, help="多少个 epoch 后再启用 refmodel attention KL")
     parser.add_argument("--anchor-ref-attn-kl-weight", dest="anchor_ref_attn_kl_weight", type=float, default=None, help="固定 anchor refmodel attention KL 权重")
     parser.add_argument("--anchor-ref-warmup-epochs", dest="anchor_ref_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 anchor refmodel attention KL")
     parser.add_argument("--teacher-attn-kl-weight", dest="teacher_attn_kl_weight", type=float, default=None, help="FP teacher attention KL 权重")
     parser.add_argument("--teacher-attn-kl-warmup-epochs", dest="teacher_attn_kl_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 FP teacher attention KL")
+    parser.add_argument("--setup-alpha-batches", dest="setup_alpha_batches", type=int, default=None, help="number of train batches used for quantizer alpha initialization")
     parser.add_argument("--ref-attn-kl-weight-epoch-overrides", dest="ref_attn_kl_weight_epoch_overrides", type=str, default=None, help="按 epoch 覆盖 prev-step KL 权重，格式 epoch:value,epoch:value")
     parser.add_argument("--anchor-ref-attn-kl-weight-epoch-overrides", dest="anchor_ref_attn_kl_weight_epoch_overrides", type=str, default=None, help="按 epoch 覆盖 anchor KL 权重，格式 epoch:value,epoch:value")
     parser.add_argument("--epoch-lr-overrides", dest="epoch_lr_overrides", type=str, default=None, help="按 epoch 固定 LR，格式 epoch:value,epoch:value")
     parser.add_argument("--quant-only-start-epoch", dest="quant_only_start_epoch", type=int, default=None, help="从该 epoch 起只训练量化和 shift 参数")
     parser.add_argument("--trainable-policy", dest="trainable_policy", choices=["all", "quant", "head_norm_quant", "head_norm_attn_quant"], default=None, help="quant-only 阶段的可训练参数集合")
+    parser.add_argument("--trainable-policy-update-overrides", dest="trainable_policy_update_overrides", type=str, default=None, help="按 optimizer update 切换可训练参数集合，格式 update:policy,update:policy")
+    parser.add_argument("--trainable-policy-update-mode", dest="trainable_policy_update_mode", choices=["requires_grad", "grad_mask"], default=None, help="update 级 policy 的执行方式")
     parser.add_argument("--model-ema", dest="model_ema", action="store_true", help="训练时维护 student 权重 EMA 并保存 .ema checkpoint")
     parser.add_argument("--model-ema-decay", dest="model_ema_decay", type=float, default=None, help="student 权重 EMA decay")
 
     parser.add_argument("--quantize-downsample", dest="quantize_downsample", type=str2bool, default=True, help="AOQ 是否量化 downsample")
-    parser.add_argument("--amp", action="store_true", help="AOQ mixed precision")
-    parser.add_argument("--amp-dtype", dest="amp_dtype", choices=["bf16", "fp16"], default="bf16", help="AOQ mixed precision dtype")
-    parser.add_argument("--channels-last", dest="channels_last", action="store_true", help="AOQ channels_last")
+    parser.add_argument("--amp", action="store_true", help="Enable mixed precision for supported pipelines; OFQ uses CUDA autocast")
+    parser.add_argument("--amp-dtype", dest="amp_dtype", choices=["bf16", "fp16"], default="bf16", help="Mixed precision dtype for supported pipelines")
+    parser.add_argument("--channels-last", dest="channels_last", action="store_true", help="Use channels_last memory format where supported")
     parser.add_argument("--compile", action="store_true", help="AOQ torch.compile")
     parser.add_argument("--compile-mode", dest="compile_mode", type=str, default="default", help="AOQ torch.compile mode")
     parser.add_argument("--compile-backend", dest="compile_backend", type=str, default="inductor", help="AOQ torch.compile backend")

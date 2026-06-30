@@ -178,7 +178,7 @@ class QAttention_qkreparam(deit_attention):
         ## V 
         quant_v_weight = self.v_quant(self.v.weight)
         v_out = nn.functional.linear(quant_x, quant_v_weight)
-        v_out += self.v.bias.view(1, -1).expand_as(v_out) # B,N,C
+        v_out = v_out + self.v.bias # B,N,C
     
         ## TO MULTI_HEAD V
         v_out = self.move_v_b4(v_out)
@@ -295,7 +295,7 @@ class QAttention_qkreparam_4_cga(deit_attention):
         ## V 
         quant_v_weight = self.v_quant(self.v.weight)
         v_out = nn.functional.linear(quant_x, quant_v_weight)
-        v_out += self.v.bias.view(1, -1).expand_as(v_out) # B,N,C
+        v_out = v_out + self.v.bias # B,N,C
     
         ## TO MULTI_HEAD V
         v_out = self.move_v_b4(v_out)

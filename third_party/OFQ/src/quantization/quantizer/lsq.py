@@ -14,7 +14,7 @@ def round_pass(x):
     return (y - y_grad).detach() + y_grad
 
 def clip(x, eps):
-    x_clip = torch.where(x > eps, x, eps)
+    x_clip = x.clamp_min(eps)
     return x - x.detach() + x_clip.detach()
 
 class LsqQuantizerWeight(torch.nn.Module):
@@ -89,7 +89,7 @@ class LsqQuantizerWeight(torch.nn.Module):
         else:
             s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
         
-        s_scale = grad_scale(clip(alpha, torch.tensor(1e-5).float().to(x.device)), s_grad_scale)
+        s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
 
         x = x / s_scale
         if self.bit == 1 and not self.all_positive:
@@ -277,7 +277,7 @@ class LsqQuantizerWeight_iterative_freezing(torch.nn.Module):
         else:
             s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
         
-        s_scale = grad_scale(clip(alpha, torch.tensor(1e-5).float().to(x.device)), s_grad_scale)
+        s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
 
         x = x / s_scale
         if self.bit == 1 and not self.all_positive:
@@ -364,7 +364,7 @@ class LsqQuantizer4img(torch.nn.Module):
             else:
                 print("img can only be B,C,H,W")
         
-        s_scale = grad_scale(clip(alpha, torch.tensor(1e-5).float().to(x.device)), s_grad_scale)
+        s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
 
         x = x / s_scale
         x = torch.clamp(x, self.thd_neg, self.thd_pos)
@@ -428,7 +428,7 @@ class LsqQuantizer4Conv2d(torch.nn.Module):
             else:
                 print("img can only be B,C,H,W")
         
-        s_scale = grad_scale(clip(alpha, torch.tensor(1e-5).float().to(x.device)), s_grad_scale)
+        s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
 
         x = x / s_scale
         x = torch.clamp(x, self.thd_neg, self.thd_pos)
@@ -493,7 +493,7 @@ class LsqQuantizer4head_input(torch.nn.Module):
         alpha = self.s       
         s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
         
-        s_scale = grad_scale(clip(alpha, torch.tensor(1e-5).float().to(x.device)), s_grad_scale)
+        s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
 
         x = x / s_scale
         if self.bit == 1 and not self.all_positive:
@@ -590,7 +590,7 @@ class LsqQuantizer(torch.nn.Module):
         else:
             s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
         
-        s_scale = grad_scale(clip(alpha, torch.tensor(1e-5).float().to(x.device)), s_grad_scale)
+        s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
 
         x = x / s_scale
         if self.bit == 1 and not self.all_positive:
@@ -679,7 +679,7 @@ class LsqQuantizer_only_headwise(torch.nn.Module):
         else:
             s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
         
-        s_scale = grad_scale(clip(alpha, torch.tensor(1e-5).float().to(x.device)), s_grad_scale)
+        s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
 
         x = x / s_scale
         if self.bit == 1 and not self.all_positive:
@@ -780,7 +780,7 @@ class LsqQuantizer4v(torch.nn.Module):
         else:
             s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
         
-        s_scale = grad_scale(clip(alpha, torch.tensor(1e-5).float().to(x.device)), s_grad_scale)
+        s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
 
         x = x / s_scale
         if self.bit == 1 and not self.all_positive:

@@ -21,7 +21,7 @@ def grad_scale(x, scale):
     return (y - y_grad).detach() + y_grad
 
 def clip(x, eps):
-    x_clip = torch.where(x > eps, x, eps)
+    x_clip = x.clamp_min(eps)
     return x - x.detach() + x_clip.detach()
 
 def modify_grad(x, freeze_inds):
@@ -134,18 +134,20 @@ class StatsQuantizer(nn.Module):
 
         real_weights = weight
 
-        if len(weight.shape) == 2:
-            scaling_factor = 2 * torch.mean(abs(real_weights),dim=1,keepdim=True) # dim, 1
-        elif len(weight.shape) == 3:
-            scaling_factor = 2 * torch.mean(torch.mean(abs(real_weights),dim=-1,keepdim=True),dim=0,keepdim=True) # 1, dim, 1
+        with torch.no_grad():
+            if len(weight.shape) == 2:
+                scaling_factor = 2 * real_weights.detach().abs().mean(dim=1, keepdim=True) # dim, 1
+            elif len(weight.shape) == 3:
+                scaling_factor = 2 * real_weights.detach().abs().mean(dim=-1, keepdim=True).mean(dim=0, keepdim=True) # 1, dim, 1
+            else:
+                raise ValueError(f"unsupported StatsQuantizer weight shape: {tuple(weight.shape)}")
 
-        scaling_factor = scaling_factor.detach()
-        self.s = scaling_factor.squeeze().cpu()
-        scaled_weights = real_weights/scaling_factor
-        cliped_weights = torch.clamp(scaled_weights, min=(-self.clip_val/2), max=(self.clip_val/2)-1e-6)
-        n = float(2 ** (self.num_bits - 1))
-        quan_weights_no_grad = scaling_factor * ((torch.round((cliped_weights) * n - 0.5 ) + 0.5) / n)
-        quan_weights = quan_weights_no_grad.detach() - real_weights.detach() + real_weights
+            self.s = scaling_factor.squeeze()
+            scaled_weights = real_weights.detach() / scaling_factor
+            cliped_weights = scaled_weights.clamp(-1.0, 1.0 - 1e-6)
+            n = float(2 ** (self.num_bits - 1))
+            quan_weights_no_grad = scaling_factor * ((torch.round(cliped_weights * n - 0.5) + 0.5) / n)
+        quan_weights = quan_weights_no_grad - real_weights.detach() + real_weights
 
         return quan_weights
     
@@ -172,7 +174,7 @@ class StatsQuantizer_specific_4_qkreparam_cga(nn.Module):
 
         
         scaling_factor = scaling_factor.detach()
-        self.s = scaling_factor.squeeze().cpu()
+        self.s = scaling_factor.detach().squeeze()
         scaled_weights = real_weights/scaling_factor
         cliped_weights = torch.clamp(scaled_weights, min=(-self.clip_val/2), max=(self.clip_val/2)-1e-6)
         n = float(2 ** (self.num_bits - 1))
@@ -206,15 +208,14 @@ class StatsQuantizer_4d(nn.Module): # B, num_heads, N, in_features
 
         real_weights = weight
 
-        scaling_factor = 2 * torch.mean(torch.mean(torch.mean(abs(real_weights),dim=3,keepdim=True),dim=1,keepdim=True),dim=0,keepdim=True)
-        
-        scaling_factor = scaling_factor.detach()
-        self.s = scaling_factor.squeeze().cpu()
-        scaled_weights = real_weights/scaling_factor
-        cliped_weights = torch.clamp(scaled_weights, min=(-self.clip_val/2), max=(self.clip_val/2)-1e-6)
-        n = float(2 ** (self.num_bits - 1))
-        quan_weights_no_grad = scaling_factor * ((torch.round((cliped_weights) * n - 0.5 ) + 0.5) / n)
-        quan_weights = quan_weights_no_grad.detach() - real_weights.detach() + real_weights
+        with torch.no_grad():
+            scaling_factor = 2 * real_weights.detach().abs().mean(dim=3, keepdim=True).mean(dim=1, keepdim=True).mean(dim=0, keepdim=True)
+            self.s = scaling_factor.squeeze()
+            scaled_weights = real_weights.detach() / scaling_factor
+            cliped_weights = scaled_weights.clamp(-1.0, 1.0 - 1e-6)
+            n = float(2 ** (self.num_bits - 1))
+            quan_weights_no_grad = scaling_factor * ((torch.round(cliped_weights * n - 0.5) + 0.5) / n)
+        quan_weights = quan_weights_no_grad - real_weights.detach() + real_weights
 
         return quan_weights
 

@@ -72,7 +72,7 @@ class QLinear(nn.Linear):
         input = self.move_aft(input)
         out = nn.functional.linear(input, weight)
         if not self.bias is None:
-            out += self.bias.view(1, -1).expand_as(out)
+            out = out + self.bias
 
         return out
 
@@ -237,7 +237,7 @@ class LSQ_QLinear4head(nn.Linear):
         input = self.move_aft(input)
         out = nn.functional.linear(input, weight)
         if not self.bias is None:
-            out += self.bias.view(1, -1).expand_as(out)
+            out = out + self.bias
 
         return out
 
@@ -298,7 +298,7 @@ class LSQ_w_and_act_QLinear(nn.Linear):
         input = self.move_aft(input)
         out = nn.functional.linear(input, weight)
         if not self.bias is None:
-            out += self.bias.view(1, -1).expand_as(out)
+            out = out + self.bias
 
         return out
 

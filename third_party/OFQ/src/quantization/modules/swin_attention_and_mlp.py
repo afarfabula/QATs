@@ -86,8 +86,9 @@ class QAttention_swin(ShiftedWindowAttention):
         self.attention_dropout = 0.0
         self.dropout = 0.0
 
+        self.relative_position_bias_table.data.copy_(m.relative_position_bias_table.detach())
         self.qkv = QLinear(
-            m = self.qkv,
+            m = m.qkv,
             weight_bits = weight_bits,
             input_bits = input_bits,
             weight_channelwise = weight_channelwise,
@@ -100,7 +101,7 @@ class QAttention_swin(ShiftedWindowAttention):
             pretrained_initialized = pretrained_initialized
         )
         self.proj = QLinear(
-            m = self.proj,
+            m = m.proj,
             weight_bits = weight_bits,
             input_bits = input_bits,
             weight_channelwise = weight_channelwise,
@@ -239,10 +240,6 @@ class QAttention_swin(ShiftedWindowAttention):
         # unpad features
         x = x[:, :H, :W, :].contiguous()
         if self.qqkkvv:
-            q = nn.functional.linear(quant_x, self.q.weight, self.q.bias)
-            k = nn.functional.linear(quant_x, self.k.weight, self.k.bias)
-            q = q.reshape(B * num_windows, self.window_size[0] * self.window_size[1], self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-            k = k.reshape(B * num_windows, self.window_size[0] * self.window_size[1], self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
             q_score = torch.matmul(q, q.transpose(-1, -2))
             q_score = q_score / math.sqrt(C // self.num_heads)
             k_score = torch.matmul(k, k.transpose(-1, -2))
@@ -382,7 +379,7 @@ class QAttention_swin_qkreparam(ShiftedWindowAttention):
         ## V 
         quant_v_weight = self.v_quant(self.v.weight)
         v_out = nn.functional.linear(quant_x, quant_v_weight)
-        v_out += self.v.bias.view(1, -1).expand_as(v_out) # B*nW, Ws*Ws, C
+        v_out = v_out + self.v.bias # B*nW, Ws*Ws, C
         ## TO MULTI_HEAD V
         v_out = self.move_v_b4(v_out)
         v_out = self.quan_a_v_fn(v_out)    
@@ -598,7 +595,7 @@ class QAttention_swin_qkreparam_4_cga(ShiftedWindowAttention):
         ## V 
         quant_v_weight = self.v_quant(self.v.weight)
         v_out = nn.functional.linear(quant_x, quant_v_weight)
-        v_out += self.v.bias.view(1, -1).expand_as(v_out) # B*nW, Ws*Ws, C
+        v_out = v_out + self.v.bias # B*nW, Ws*Ws, C
         ## TO MULTI_HEAD V
         v_out = self.move_v_b4(v_out)
         v_out = self.quan_a_v_fn(v_out)    
