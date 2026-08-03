@@ -596,6 +596,7 @@ def build_ofq(args: argparse.Namespace) -> Tuple[List[str], Path, Dict[str, str]
     append_optional_value(command, "--anchor-ref-head-mode", args.anchor_ref_head_mode)
     append_optional_value(command, "--teacher-attn-kl-weight", args.teacher_attn_kl_weight)
     append_optional_value(command, "--teacher-attn-kl-warmup-epochs", args.teacher_attn_kl_warmup_epochs)
+    append_optional_value(command, "--teacher-attn-kl-weight-epoch-overrides", getattr(args, "teacher_attn_kl_weight_epoch_overrides", None))
     append_optional_value(command, "--teacher-attn-output-weight", args.teacher_attn_output_weight)
     append_optional_value(command, "--teacher-attn-output-layers", args.teacher_attn_output_layers)
     append_optional_value(command, "--teacher-attn-output-warmup-epochs", args.teacher_attn_output_warmup_epochs)
@@ -937,6 +938,7 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--ref-stop-updates", dest="ref_stop_updates", type=int)
     parser.add_argument("--teacher-attn-kl-weight", dest="teacher_attn_kl_weight", type=float)
     parser.add_argument("--teacher-attn-kl-warmup-epochs", dest="teacher_attn_kl_warmup_epochs", type=int)
+    parser.add_argument("--teacher-attn-kl-weight-epoch-overrides", dest="teacher_attn_kl_weight_epoch_overrides", type=str)
     parser.add_argument("--ref-head-mode-epoch-overrides", dest="ref_head_mode_epoch_overrides", type=str)
     parser.add_argument("--teacher-attn-output-weight", dest="teacher_attn_output_weight", type=float)
     parser.add_argument("--teacher-attn-output-layers", dest="teacher_attn_output_layers", type=str)
@@ -1388,6 +1390,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "anchor_ref_head_mode": "",
         "teacher_attn_kl_weight": 0.0,
         "teacher_attn_kl_warmup_epochs": 0,
+        "teacher_attn_kl_weight_epoch_overrides": "",
         "teacher_attn_output_weight": 0.0,
         "teacher_attn_output_layers": "all",
         "teacher_attn_output_warmup_epochs": 0,
@@ -1715,6 +1718,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["teacher_attn_kl_weight"] = args.teacher_attn_kl_weight
     if args.teacher_attn_kl_warmup_epochs is not None:
         defaults["teacher_attn_kl_warmup_epochs"] = args.teacher_attn_kl_warmup_epochs
+    if getattr(args, "teacher_attn_kl_weight_epoch_overrides", None) is not None:
+        defaults["teacher_attn_kl_weight_epoch_overrides"] = args.teacher_attn_kl_weight_epoch_overrides
     if args.teacher_attn_output_weight is not None:
         defaults["teacher_attn_output_weight"] = args.teacher_attn_output_weight
     if args.teacher_attn_output_layers is not None:
@@ -2101,6 +2106,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["anchor_ref_head_mode"] = str(defaults.get("anchor_ref_head_mode") or "")
     defaults["teacher_attn_kl_weight"] = float(defaults["teacher_attn_kl_weight"])
     defaults["teacher_attn_kl_warmup_epochs"] = int(defaults["teacher_attn_kl_warmup_epochs"])
+    defaults["teacher_attn_kl_weight_epoch_overrides"] = parse_epoch_float_overrides(defaults.get("teacher_attn_kl_weight_epoch_overrides"))
     defaults["teacher_attn_output_weight"] = float(defaults["teacher_attn_output_weight"])
     defaults["teacher_attn_output_layers"] = str(defaults.get("teacher_attn_output_layers", "all"))
     defaults["teacher_attn_output_warmup_epochs"] = int(defaults["teacher_attn_output_warmup_epochs"])
@@ -7670,6 +7676,14 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                         f"reason={epoch_dynamic_reason}, "
                         f"selected_head_map={selected_head_map}, anchor_selected_head_map={anchor_selected_head_map}"
                     )
+            teacher_attn_kl_weight_override = runtime_args.teacher_attn_kl_weight_epoch_overrides.get(epoch)
+            if teacher_attn_kl_weight_override is not None:
+                runtime_args.teacher_attn_kl_weight = float(teacher_attn_kl_weight_override)
+                if runtime_args.local_rank == 0:
+                    print(
+                        "Applied teacher attention-KL weight override: "
+                        f"epoch={epoch}, weight={teacher_attn_kl_weight_override}"
+                    )
             teacher_attn_output_weight_override = runtime_args.teacher_attn_output_weight_epoch_overrides.get(epoch)
             if teacher_attn_output_weight_override is not None:
                 runtime_args.teacher_attn_output_weight = float(teacher_attn_output_weight_override)
@@ -8248,6 +8262,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-ref-head-mode", dest="anchor_ref_head_mode", type=str, default=None, help="固定 anchor refmodel 单独使用的 head mode；为空则沿用 --ref-head-mode")
     parser.add_argument("--teacher-attn-kl-weight", dest="teacher_attn_kl_weight", type=float, default=None, help="FP teacher attention KL 权重")
     parser.add_argument("--teacher-attn-kl-warmup-epochs", dest="teacher_attn_kl_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 FP teacher attention KL")
+    parser.add_argument("--teacher-attn-kl-weight-epoch-overrides", dest="teacher_attn_kl_weight_epoch_overrides", type=str, default=None, help="按 epoch 覆盖 FP teacher attention KL 权重，格式 epoch:value,epoch:value")
     parser.add_argument("--teacher-attn-output-weight", dest="teacher_attn_output_weight", type=float, default=None, help="FP teacher attention module output MSE 权重")
     parser.add_argument("--teacher-attn-output-layers", dest="teacher_attn_output_layers", type=str, default=None, help="teacher attention output MSE 层选择: all 或逗号分隔 attention layer index")
     parser.add_argument("--teacher-attn-output-warmup-epochs", dest="teacher_attn_output_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 FP teacher attention output MSE")
