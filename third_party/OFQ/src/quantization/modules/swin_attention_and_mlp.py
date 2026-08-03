@@ -86,7 +86,6 @@ class QAttention_swin(ShiftedWindowAttention):
         self.attention_dropout = 0.0
         self.dropout = 0.0
 
-        self.relative_position_bias_table.data.copy_(m.relative_position_bias_table.detach())
         self.qkv = QLinear(
             m = m.qkv,
             weight_bits = weight_bits,
@@ -139,6 +138,7 @@ class QAttention_swin(ShiftedWindowAttention):
         self.register_buffer("relative_position_index", relative_position_index)
 
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+        self.relative_position_bias_table.data.copy_(m.relative_position_bias_table.detach())
         
 
     def forward(self, x):
@@ -249,6 +249,11 @@ class QAttention_swin(ShiftedWindowAttention):
             
             return x, (attn, q_score, k_score, v_score)
         elif getattr(self, 'collect_attention', False):
+            head_indices = getattr(self, 'collect_attention_head_indices', None)
+            if head_indices is not None:
+                if len(head_indices) == 0:
+                    return x, None
+                attn = attn[:, head_indices]
             return x, attn
         else:
             return x, None
@@ -283,6 +288,8 @@ class QAttention_swin_qkreparam(ShiftedWindowAttention):
         self.q = nn.Linear(in_features=m.qkv.in_features,out_features=m.qkv.in_features, bias=False)
         self.k = nn.Linear(in_features=m.qkv.in_features,out_features=m.qkv.in_features, bias= False)
         self.v = nn.Linear(in_features=m.qkv.in_features,out_features=m.qkv.in_features)
+        self.register_buffer("q_bias", torch.zeros(m.qkv.in_features))
+        self.register_buffer("k_bias", torch.zeros(m.qkv.in_features))
 
         if pretrained_initialized:
             with torch.no_grad():
@@ -292,13 +299,15 @@ class QAttention_swin_qkreparam(ShiftedWindowAttention):
                 self.q.weight.copy_(copy_weight[:q_k_v_dim*1,:])
                 self.k.weight.copy_(copy_weight[q_k_v_dim*1:q_k_v_dim*2,:])
                 self.v.weight.copy_(copy_weight[q_k_v_dim*2:q_k_v_dim*3,:])
+                self.q_bias.copy_(copy_bias[:q_k_v_dim*1])
+                self.k_bias.copy_(copy_bias[q_k_v_dim*1:q_k_v_dim*2])
                 self.v.bias.copy_(copy_bias[q_k_v_dim*2:q_k_v_dim*3])
         
         self.qk_quant = StatsQuantizer(num_bits=self.weight_bits, clip_learnable=wq_learnable) # num_heads*in_features, in_features
         self.v_quant = StatsQuantizer(num_bits=self.weight_bits, clip_learnable=wq_learnable) #.to(m.weight.device)
 
         self.proj = QLinear(
-            m = self.proj,
+            m = m.proj,
             weight_bits = weight_bits,
             input_bits = input_bits,
             weight_channelwise = weight_channelwise,
@@ -342,6 +351,7 @@ class QAttention_swin_qkreparam(ShiftedWindowAttention):
         self.register_buffer("relative_position_index", relative_position_index)
 
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+        self.relative_position_bias_table.data.copy_(m.relative_position_bias_table.detach())
         
 
     def forward(self, x):
@@ -409,6 +419,15 @@ class QAttention_swin_qkreparam(ShiftedWindowAttention):
         
         ## x@W_qk@X^T, quant_x: B,N,C and quant_qkx: B,num_heads, C, N
         xqkx = torch.einsum('BNC,BHCD -> BHND',quant_x,quant_qkx) # B*nW, num_heads, Ws*Ws, Ws*Ws
+        q_linear = nn.functional.linear(quant_x, self.q.weight)
+        k_linear = nn.functional.linear(quant_x, self.k.weight)
+        q_linear = q_linear.reshape(B*num_windows, self.window_size[0] * self.window_size[1], self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        k_linear = k_linear.reshape(B*num_windows, self.window_size[0] * self.window_size[1], self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        q_bias = self.q_bias.reshape(self.num_heads, C // self.num_heads)
+        k_bias = self.k_bias.reshape(self.num_heads, C // self.num_heads)
+        xqkx = xqkx + torch.einsum('BHQD,HD->BHQ', q_linear, k_bias).unsqueeze(-1)
+        xqkx = xqkx + torch.einsum('BHKD,HD->BHK', k_linear, q_bias).unsqueeze(-2)
+        xqkx = xqkx + torch.einsum('HD,HD->H', q_bias, k_bias).view(1, self.num_heads, 1, 1)
         # B, num_heads, N, C // self.num_heads
         value_4_softmax = xqkx
         attn = value_4_softmax * ((C // self.num_heads) ** -0.5)
@@ -452,8 +471,8 @@ class QAttention_swin_qkreparam(ShiftedWindowAttention):
         # unpad features
         x = x[:, :H, :W, :].contiguous()
         if self.qqkkvv:
-            q = nn.functional.linear(quant_x, self.q.weight, self.q.bias)
-            k = nn.functional.linear(quant_x, self.k.weight, self.k.bias)
+            q = nn.functional.linear(quant_x, self.q.weight, self.q_bias)
+            k = nn.functional.linear(quant_x, self.k.weight, self.k_bias)
             q = q.reshape(B * num_windows, self.window_size[0] * self.window_size[1], self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
             k = k.reshape(B * num_windows, self.window_size[0] * self.window_size[1], self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
             q_score = torch.matmul(q, q.transpose(-1, -2))
@@ -465,6 +484,11 @@ class QAttention_swin_qkreparam(ShiftedWindowAttention):
             
             return x, (attn, q_score, k_score, v_score)
         elif getattr(self, 'collect_attention', False):
+            head_indices = getattr(self, 'collect_attention_head_indices', None)
+            if head_indices is not None:
+                if len(head_indices) == 0:
+                    return x, None
+                attn = attn[:, head_indices]
             return x, attn
         else:
             return x, None
@@ -499,6 +523,8 @@ class QAttention_swin_qkreparam_4_cga(ShiftedWindowAttention):
         self.q = nn.Linear(in_features=m.qkv.in_features,out_features=m.qkv.in_features, bias=False)
         self.k = nn.Linear(in_features=m.qkv.in_features,out_features=m.qkv.in_features, bias= False)
         self.v = nn.Linear(in_features=m.qkv.in_features,out_features=m.qkv.in_features)
+        self.register_buffer("q_bias", torch.zeros(m.qkv.in_features))
+        self.register_buffer("k_bias", torch.zeros(m.qkv.in_features))
 
         if pretrained_initialized:
             with torch.no_grad():
@@ -508,13 +534,15 @@ class QAttention_swin_qkreparam_4_cga(ShiftedWindowAttention):
                 self.q.weight.copy_(copy_weight[:q_k_v_dim*1,:])
                 self.k.weight.copy_(copy_weight[q_k_v_dim*1:q_k_v_dim*2,:])
                 self.v.weight.copy_(copy_weight[q_k_v_dim*2:q_k_v_dim*3,:])
+                self.q_bias.copy_(copy_bias[:q_k_v_dim*1])
+                self.k_bias.copy_(copy_bias[q_k_v_dim*1:q_k_v_dim*2])
                 self.v.bias.copy_(copy_bias[q_k_v_dim*2:q_k_v_dim*3])
         
         self.qk_quant = StatsQuantizer_specific_4_qkreparam_cga(num_bits=self.weight_bits, clip_learnable=wq_learnable, boundaryRange=boundaryRange) # num_heads*in_features, in_features
         self.v_quant = StatsQuantizer(num_bits=self.weight_bits, clip_learnable=wq_learnable) #.to(m.weight.device)
 
         self.proj = QLinear(
-            m = self.proj,
+            m = m.proj,
             weight_bits = weight_bits,
             input_bits = input_bits,
             weight_channelwise = weight_channelwise,
@@ -558,6 +586,7 @@ class QAttention_swin_qkreparam_4_cga(ShiftedWindowAttention):
         self.register_buffer("relative_position_index", relative_position_index)
 
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+        self.relative_position_bias_table.data.copy_(m.relative_position_bias_table.detach())
         
 
     def forward(self, x):
@@ -677,6 +706,11 @@ class QAttention_swin_qkreparam_4_cga(ShiftedWindowAttention):
             
             return x, (attn, q_score, k_score, v_score)
         elif getattr(self, 'collect_attention', False):
+            head_indices = getattr(self, 'collect_attention_head_indices', None)
+            if head_indices is not None:
+                if len(head_indices) == 0:
+                    return x, None
+                attn = attn[:, head_indices]
             return x, attn
         else:
             return x, None

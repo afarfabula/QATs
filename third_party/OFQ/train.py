@@ -98,6 +98,78 @@ def format_eta_duration(seconds):
     return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
 
 
+def parse_progressive_bit_schedule(schedule_text):
+    schedule = []
+    for item in str(schedule_text or '').split(','):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(':')
+        if len(parts) != 3:
+            raise ValueError(
+                f'invalid progressive bit schedule item {item!r}; '
+                'expected epoch:wbits:abits'
+            )
+        epoch, wbits, abits = (int(part) for part in parts)
+        if epoch < 0 or wbits < 1 or abits < 1:
+            raise ValueError(f'invalid progressive bit schedule item {item!r}')
+        schedule.append((epoch, wbits, abits))
+    return sorted(schedule, key=lambda x: x[0])
+
+
+def bits_for_epoch(schedule, epoch, default_wbits, default_abits):
+    wbits, abits = int(default_wbits), int(default_abits)
+    for start_epoch, scheduled_wbits, scheduled_abits in schedule:
+        if epoch >= start_epoch:
+            wbits, abits = scheduled_wbits, scheduled_abits
+        else:
+            break
+    return wbits, abits
+
+
+def quant_thresholds(bit, all_positive=False):
+    bit = int(bit)
+    if all_positive:
+        if bit == 1:
+            return 0, 1
+        return 0, 2 ** bit - 1
+    if bit == 1:
+        return -1, 1
+    return -2 ** (bit - 1), 2 ** (bit - 1) - 1
+
+
+def set_fake_quant_bits(model, wbits, abits):
+    wbits, abits = int(wbits), int(abits)
+    weight_modules = 0
+    act_modules = 0
+    for module in model.modules():
+        if hasattr(module, 'weight_bits'):
+            module.weight_bits = wbits
+            weight_modules += 1
+        if hasattr(module, 'input_bits'):
+            module.input_bits = abits
+        for attr in ('statsq_fn', 'qk_quant', 'v_quant'):
+            quantizer = getattr(module, attr, None)
+            if quantizer is not None and hasattr(quantizer, 'num_bits'):
+                quantizer.num_bits = wbits
+                weight_modules += 1
+        for attr in ('lsqw_fn',):
+            quantizer = getattr(module, attr, None)
+            if quantizer is not None and hasattr(quantizer, 'bit'):
+                quantizer.bit = wbits
+                if hasattr(quantizer, 'all_positive') and hasattr(quantizer, 'thd_neg') and hasattr(quantizer, 'thd_pos'):
+                    quantizer.thd_neg, quantizer.thd_pos = quant_thresholds(wbits, quantizer.all_positive)
+                weight_modules += 1
+        for attr in ('input_quant_fn', 'quant_x_4_qkv', 'quan_a_qkx_fn'):
+            quantizer = getattr(module, attr, None)
+            if quantizer is not None and hasattr(quantizer, 'bit'):
+                quantizer.bit = abits
+                if hasattr(quantizer, 'all_positive') and hasattr(quantizer, 'thd_neg') and hasattr(quantizer, 'thd_pos'):
+                    quantizer.thd_neg, quantizer.thd_pos = quant_thresholds(abits, quantizer.all_positive)
+                act_modules += 1
+    return weight_modules, act_modules
+
+
 class ImageNetParquetDataset(Dataset):
     def __init__(self, root, split='train', transform=None):
         self.root = root
@@ -505,6 +577,8 @@ parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
                     help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
 parser.add_argument('--epochs', type=int, default=200, metavar='N',
                     help='number of epochs to train (default: 2)')
+parser.add_argument('--scheduler-epochs', type=int, default=None, metavar='N',
+                    help='number of epochs used to parameterize the LR scheduler; defaults to --epochs')
 parser.add_argument('--epoch-repeats', type=float, default=0., metavar='N',
                     help='epoch repeat multiplier (number of times to repeat dataset epoch per train epoch).')
 parser.add_argument('--start-epoch', default=None, type=int, metavar='N',
@@ -696,6 +770,8 @@ parser.add_argument('--gpu_id', default=0, type=int,
 parser.add_argument('--model_type', type=str, default="deit", help='model type to quantize: deit or swin')
 parser.add_argument('--quantized', action='store_true', default=False,
                     help='whether to quantize model')
+parser.add_argument('--progressive-bit-schedule', type=str, default='',
+                    help='epoch-wise fake-quant bit schedule, format epoch:wbits:abits,...; empty keeps fixed bits')
 
 parser.add_argument('--world_size', type=str, default='1', help='number of gpu to use for training')
 parser.add_argument('--visible_gpu', type=str, default='0', help='indicate which gpus to use for distributed training')
@@ -1127,6 +1203,19 @@ def main(local_rank, args):
 
     
 
+    progressive_bit_schedule = parse_progressive_bit_schedule(getattr(args, 'progressive_bit_schedule', ''))
+    if progressive_bit_schedule:
+        initial_wbits, initial_abits = bits_for_epoch(
+            progressive_bit_schedule, 0, args.wq_bitw, args.aq_bitw)
+        weight_modules, act_modules = set_fake_quant_bits(model, initial_wbits, initial_abits)
+        args.wq_bitw = initial_wbits
+        args.aq_bitw = initial_abits
+        if args.local_rank == 0:
+            _logger.info(
+                'Applied progressive fake-quant bits before setup_alpha: '
+                f'epoch=0 wbits={initial_wbits} abits={initial_abits} '
+                f'weight_modules={weight_modules} act_modules={act_modules}')
+
     ## have to create and init all the parameters before send to optimizer (important!)
     setup_alpha(model=model,loader=loader_train,args=args)
     # when creating optimizer, only weights and emb have weight-decay
@@ -1215,8 +1304,15 @@ def main(local_rank, args):
             )
         args.epochs = adjusted_epochs
 
-    # setup learning rate schedule and starting epoch
-    lr_scheduler, num_epochs = create_scheduler(args, optimizer)
+    # setup learning rate schedule and starting epoch. Keep args.epochs as the
+    # actual training loop length while allowing short/long cosine schedules.
+    train_epochs = args.epochs
+    scheduler_epochs = getattr(args, 'scheduler_epochs', None)
+    if scheduler_epochs is not None:
+        args.epochs = int(scheduler_epochs)
+    lr_scheduler, _scheduler_num_epochs = create_scheduler(args, optimizer)
+    args.epochs = train_epochs
+    num_epochs = train_epochs
     start_epoch = 0
     if args.start_epoch is not None:
         # a specified start_epoch will always override the resume epoch
@@ -1321,6 +1417,17 @@ def main(local_rank, args):
     try:
             
         for epoch in range(start_epoch, num_epochs):
+            if progressive_bit_schedule:
+                scheduled_wbits, scheduled_abits = bits_for_epoch(
+                    progressive_bit_schedule, epoch, args.wq_bitw, args.aq_bitw)
+                weight_modules, act_modules = set_fake_quant_bits(model, scheduled_wbits, scheduled_abits)
+                args.wq_bitw = scheduled_wbits
+                args.aq_bitw = scheduled_abits
+                if args.local_rank == 0:
+                    _logger.info(
+                        'Applied progressive fake-quant bits: '
+                        f'epoch={epoch} wbits={scheduled_wbits} abits={scheduled_abits} '
+                        f'weight_modules={weight_modules} act_modules={act_modules}')
             if hasattr(dataset_train, 'set_epoch'):
                 dataset_train.set_epoch(epoch)
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):

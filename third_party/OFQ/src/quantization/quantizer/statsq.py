@@ -128,6 +128,7 @@ class StatsQuantizer(nn.Module):
         self.clip_val = nn.Parameter(torch.Tensor([init_act_clip_val]), requires_grad=False)
 
         self.s = None
+        self.aoq_scale_ratio = 1.0
 
     
     def forward(self, weight):
@@ -142,6 +143,7 @@ class StatsQuantizer(nn.Module):
             else:
                 raise ValueError(f"unsupported StatsQuantizer weight shape: {tuple(weight.shape)}")
 
+            scaling_factor = scaling_factor * float(getattr(self, "aoq_scale_ratio", 1.0))
             self.s = scaling_factor.squeeze()
             scaled_weights = real_weights.detach() / scaling_factor
             cliped_weights = scaled_weights.clamp(-1.0, 1.0 - 1e-6)
@@ -162,6 +164,7 @@ class StatsQuantizer_specific_4_qkreparam_cga(nn.Module):
         self.clip_val = nn.Parameter(torch.Tensor([init_act_clip_val]), requires_grad=False)
         self.s = None
         self.boundaryRange = boundaryRange 
+        self.aoq_scale_ratio = 1.0
     
     def forward(self, weight):
 
@@ -173,7 +176,7 @@ class StatsQuantizer_specific_4_qkreparam_cga(nn.Module):
             scaling_factor = 2 * torch.mean(torch.mean(abs(real_weights),dim=-1,keepdim=True),dim=0,keepdim=True) # 1, dim, 1
 
         
-        scaling_factor = scaling_factor.detach()
+        scaling_factor = scaling_factor.detach() * float(getattr(self, "aoq_scale_ratio", 1.0))
         self.s = scaling_factor.detach().squeeze()
         scaled_weights = real_weights/scaling_factor
         cliped_weights = torch.clamp(scaled_weights, min=(-self.clip_val/2), max=(self.clip_val/2)-1e-6)
@@ -203,6 +206,7 @@ class StatsQuantizer_4d(nn.Module): # B, num_heads, N, in_features
         init_act_clip_val = 2.0
         self.clip_val = nn.Parameter(torch.Tensor([init_act_clip_val]), requires_grad=False)
         self.s = None
+        self.aoq_scale_ratio = 1.0
     
     def forward(self, weight):
 
@@ -210,6 +214,7 @@ class StatsQuantizer_4d(nn.Module): # B, num_heads, N, in_features
 
         with torch.no_grad():
             scaling_factor = 2 * real_weights.detach().abs().mean(dim=3, keepdim=True).mean(dim=1, keepdim=True).mean(dim=0, keepdim=True)
+            scaling_factor = scaling_factor * float(getattr(self, "aoq_scale_ratio", 1.0))
             self.s = scaling_factor.squeeze()
             scaled_weights = real_weights.detach() / scaling_factor
             cliped_weights = scaled_weights.clamp(-1.0, 1.0 - 1e-6)
@@ -218,7 +223,6 @@ class StatsQuantizer_4d(nn.Module): # B, num_heads, N, in_features
         quan_weights = quan_weights_no_grad - real_weights.detach() + real_weights
 
         return quan_weights
-
 
 
 

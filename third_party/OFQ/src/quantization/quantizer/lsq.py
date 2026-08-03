@@ -45,6 +45,11 @@ class LsqQuantizerWeight(torch.nn.Module):
         # you need to register the parameter names earlier
         self.register_parameter('s', None)
         self.initialized_alpha = False
+        self.aoq_scale_ratio = 1.0
+        self.aoq_threshold_ratio = None
+        self.aoq_selective_margin = 0.0
+        self.aoq_quality_mode = "none"
+        self.aoq_quality_mask = None
 
     def init_from(self, x, *args, **kwargs):
         if self.per_channel:
@@ -89,15 +94,38 @@ class LsqQuantizerWeight(torch.nn.Module):
         else:
             s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
         
-        s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
+        s_base = grad_scale(clip(alpha, 1e-5), s_grad_scale)
+        aoq_ratio = float(getattr(self, "aoq_scale_ratio", 1.0))
+        aoq_threshold_ratio = getattr(self, "aoq_threshold_ratio", None)
+        aoq_threshold_ratio = aoq_ratio if aoq_threshold_ratio is None else float(aoq_threshold_ratio)
+        aoq_margin = float(getattr(self, "aoq_selective_margin", 0.0))
+        if aoq_margin > 0.0 and abs(aoq_threshold_ratio - 1.0) > 1e-12:
+            x_base = x / s_base
+            center_dist = torch.abs(x_base - torch.round(x_base)).clamp(max=0.5)
+            boundary_dist = 0.5 - center_dist
+            near_boundary = boundary_dist <= aoq_margin
+            if str(getattr(self, "aoq_quality_mode", "none") or "none") != "none":
+                quality_mask = getattr(self, "aoq_quality_mask", None)
+                if quality_mask is None:
+                    near_boundary = torch.zeros_like(near_boundary, dtype=torch.bool)
+                else:
+                    quality_mask = quality_mask.to(device=near_boundary.device, dtype=torch.bool)
+                    if quality_mask.shape != near_boundary.shape:
+                        quality_mask = torch.broadcast_to(quality_mask, near_boundary.shape)
+                    near_boundary = near_boundary & quality_mask
+            s_threshold = torch.where(near_boundary, s_base * aoq_threshold_ratio, s_base)
+            s_level = torch.where(near_boundary, s_base * aoq_ratio, s_base)
+        else:
+            s_threshold = s_base * aoq_threshold_ratio
+            s_level = s_base * aoq_ratio
 
-        x = x / s_scale
+        x = x / s_threshold
         if self.bit == 1 and not self.all_positive:
             x = torch.sign(x)
         else:
             x = torch.clamp(x, self.thd_neg, self.thd_pos)
             x = round_pass(x)
-        x = x * s_scale
+        x = x * s_level
         return x
 
     def extra_repr(self):
@@ -398,6 +426,11 @@ class LsqQuantizer4Conv2d(torch.nn.Module):
             self.thd_pos = 2 ** (self.bit - 1) - 1
         self.register_parameter('s', None)
         self.initialized_alpha = False
+        self.aoq_scale_ratio = 1.0
+        self.aoq_threshold_ratio = None
+        self.aoq_selective_margin = 0.0
+        self.aoq_quality_mode = "none"
+        self.aoq_quality_mask = None
 
     def init_from(self, x, *args, **kwargs):
         if self.per_channel:
@@ -428,12 +461,35 @@ class LsqQuantizer4Conv2d(torch.nn.Module):
             else:
                 print("img can only be B,C,H,W")
         
-        s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
+        s_base = grad_scale(clip(alpha, 1e-5), s_grad_scale)
+        aoq_ratio = float(getattr(self, "aoq_scale_ratio", 1.0))
+        aoq_threshold_ratio = getattr(self, "aoq_threshold_ratio", None)
+        aoq_threshold_ratio = aoq_ratio if aoq_threshold_ratio is None else float(aoq_threshold_ratio)
+        aoq_margin = float(getattr(self, "aoq_selective_margin", 0.0))
+        if aoq_margin > 0.0 and abs(aoq_threshold_ratio - 1.0) > 1e-12:
+            x_base = x / s_base
+            center_dist = torch.abs(x_base - torch.round(x_base)).clamp(max=0.5)
+            boundary_dist = 0.5 - center_dist
+            near_boundary = boundary_dist <= aoq_margin
+            if str(getattr(self, "aoq_quality_mode", "none") or "none") != "none":
+                quality_mask = getattr(self, "aoq_quality_mask", None)
+                if quality_mask is None:
+                    near_boundary = torch.zeros_like(near_boundary, dtype=torch.bool)
+                else:
+                    quality_mask = quality_mask.to(device=near_boundary.device, dtype=torch.bool)
+                    if quality_mask.shape != near_boundary.shape:
+                        quality_mask = torch.broadcast_to(quality_mask, near_boundary.shape)
+                    near_boundary = near_boundary & quality_mask
+            s_threshold = torch.where(near_boundary, s_base * aoq_threshold_ratio, s_base)
+            s_level = torch.where(near_boundary, s_base * aoq_ratio, s_base)
+        else:
+            s_threshold = s_base * aoq_threshold_ratio
+            s_level = s_base * aoq_ratio
 
-        x = x / s_scale
+        x = x / s_threshold
         x = torch.clamp(x, self.thd_neg, self.thd_pos)
         x = round_pass(x)
-        x = x * s_scale
+        x = x * s_level
         return x
 
     def extra_repr(self):
@@ -798,4 +854,3 @@ class LsqQuantizer4v(torch.nn.Module):
             f"s_learnable={self.learnable}, "
             f"per_channel={self.per_channel}"
         )
-
