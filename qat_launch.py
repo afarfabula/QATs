@@ -758,6 +758,12 @@ def build_ofq(args: argparse.Namespace) -> Tuple[List[str], Path, Dict[str, str]
     append_optional_flag(command, "--model-ema", args.model_ema)
     append_optional_value(command, "--model-ema-decay", args.model_ema_decay)
     append_optional_value(command, "--post-resume-setup-alpha-batches", args.post_resume_setup_alpha_batches)
+    use_native_amp = bool(getattr(args, "native_amp", False))
+    append_optional_flag(command, "--amp", args.amp)
+    append_optional_flag(command, "--native-amp", use_native_amp)
+    append_optional_value(command, "--amp-dtype", args.amp_dtype if args.amp or use_native_amp else None)
+    append_optional_flag(command, "--channels-last", args.channels_last)
+    append_optional_flag(command, "--pin-mem", getattr(args, "pin_mem", False))
 
     command.extend(args.extra_arg)
     return command, repo, env

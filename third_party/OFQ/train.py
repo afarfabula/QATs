@@ -30,6 +30,7 @@ import logging
 import random as pyrandom
 from collections import OrderedDict
 from contextlib import nullcontext, suppress
+from functools import partial
 from datetime import datetime, timedelta
 
 import torch
@@ -692,6 +693,8 @@ parser.add_argument('--apex-amp', action='store_true', default=False,
                     help='Use NVIDIA Apex AMP mixed precision')
 parser.add_argument('--native-amp', action='store_true', default=False,
                     help='Use Native Torch AMP mixed precision')
+parser.add_argument('--amp-dtype', '--amp_dtype', dest='amp_dtype', choices=('bf16', 'fp16'), default='fp16',
+                    help='Native AMP autocast dtype. bf16 avoids loss scaling; fp16 uses NativeScaler.')
 parser.add_argument('--channels-last', action='store_true', default=False,
                     help='Use channels_last memory layout')
 parser.add_argument('--grad-accum-steps', type=int, default=1, metavar='N',
@@ -1231,10 +1234,14 @@ def main(local_rank, args):
         if args.local_rank == 0:
             _logger.info('Using NVIDIA APEX AMP. Training in mixed precision.')
     elif use_amp == 'native':
-        amp_autocast = torch.cuda.amp.autocast
-        loss_scaler = NativeScaler()
+        if args.amp_dtype == 'bf16':
+            amp_autocast = partial(torch.cuda.amp.autocast, dtype=torch.bfloat16)
+            loss_scaler = None
+        else:
+            amp_autocast = partial(torch.cuda.amp.autocast, dtype=torch.float16)
+            loss_scaler = NativeScaler()
         if args.local_rank == 0:
-            _logger.info('Using native Torch AMP. Training in mixed precision.')
+            _logger.info(f'Using native Torch AMP. Training in mixed precision dtype={args.amp_dtype}.')
     else:
         if args.local_rank == 0:
             _logger.info('AMP not enabled. Training in float32.')
