@@ -22,7 +22,7 @@ CMD=(python3 "${QATS}/qat_launch.py"
   --devices "${DEVICES}" --nproc-per-node 8 --master-port "${MASTER_PORT}"
   --model-type swin
   --teacher swin_t --teacher-type swin --teacher-checkpoint "${TEACHER}" --teacher-pretrained
-  --epochs 1 --scheduler-epochs 100 --max_train_updates 20
+  --epochs 1 --scheduler-epochs 100
   --batch-size 64 --workers 8 --lr 2e-4 --min-lr 5e-6 --weight-decay 0.0
   --epoch-checkpoint-interval 1 --checkpoint-hist 2
   --wbits 4 --abits 4 --wq-mode statsq --aq-mode lsq --wq-per-channel --aq-per-channel --aq-clip-learnable
@@ -49,6 +49,7 @@ CMD=(python3 "${QATS}/qat_launch.py"
   --extra-arg=--color-jitter --extra-arg=0.4
   --extra-arg=--reprob --extra-arg=0.25
   --extra-arg=--log-interval --extra-arg=1
+  --extra-arg=--max_train_updates --extra-arg=20
   --extra-arg=--seed --extra-arg=42
 )
 
