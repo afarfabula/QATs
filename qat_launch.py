@@ -2515,6 +2515,15 @@ def enable_attention_collection(model: nn.Module) -> int:
     return enabled
 
 
+def has_positive_epoch_override(overrides) -> bool:
+    if not overrides:
+        return False
+    try:
+        return any(float(value) > 0 for value in overrides.values())
+    except AttributeError:
+        return False
+
+
 def create_ofq_teacher_model(runtime_args: SimpleNamespace) -> nn.Module:
     qqkkvv = runtime_args.kd_hard_and_soft in {2, 3} or runtime_args.teacher_qk_rel_weight > 0 or runtime_args.teacher_qkv_rel_weight > 0
     if runtime_args.teacher_type == "deit":
@@ -2527,6 +2536,7 @@ def create_ofq_teacher_model(runtime_args: SimpleNamespace) -> nn.Module:
         load_checkpoint(teacher, runtime_args.teacher_checkpoint, strict=True)
     if (
         runtime_args.teacher_attn_kl_weight > 0
+        or has_positive_epoch_override(getattr(runtime_args, "teacher_attn_kl_weight_epoch_overrides", None))
         or runtime_args.teacher_qk_rel_weight > 0
         or str(getattr(runtime_args, "ref_head_mode", "")).startswith("dynamic_teacher_agree_top")
     ):
@@ -6249,6 +6259,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     act_bin_margin_layers = parse_name_list(getattr(runtime_args, "act_bin_margin_layers", ""))
     act_bin_margin_quantizers = parse_name_list(getattr(runtime_args, "act_bin_margin_quantizers", ""))
     capture_act_bin_margin = runtime_args.act_bin_margin_weight > 0
+    logged_teacher_attn_kl_debug = False
     if runtime_args.local_rank == 0 and teacher is not None and teacher_feature_output_layers and runtime_args.teacher_feature_output_weight > 0:
         print(
             "Teacher feature-output hooks: "
@@ -6664,6 +6675,19 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                             teacher_attn_info_for_kl = teacher_attn_output[1] if len(teacher_attn_output) > 1 else None
                         else:
                             teacher_attn_info_for_kl = None
+                    if runtime_args.local_rank == 0 and not logged_teacher_attn_kl_debug:
+                        student_attn_list = extract_attn_prob_list(student_attn_info)
+                        teacher_attn_list = extract_attn_prob_list(teacher_attn_info_for_kl)
+                        student_valid = sum(1 for item in student_attn_list if torch.is_tensor(item))
+                        teacher_valid = sum(1 for item in teacher_attn_list if torch.is_tensor(item))
+                        print(
+                            "Teacher attention-KL debug: "
+                            f"weight={runtime_args.teacher_attn_kl_weight}, "
+                            f"head_mode={runtime_args.ref_head_mode}, "
+                            f"student_layers={len(student_attn_list)}, student_valid={student_valid}, "
+                            f"teacher_layers={len(teacher_attn_list)}, teacher_valid={teacher_valid}"
+                        )
+                        logged_teacher_attn_kl_debug = True
                     teacher_attn_kl_loss = attention_kl_consistency_loss(
                         student_attn_info,
                         teacher_attn_info_for_kl,
