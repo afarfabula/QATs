@@ -5075,7 +5075,11 @@ def attention_kl_pair_loss(student_attn: torch.Tensor, ref_attn: torch.Tensor, l
 def maybe_clip_ref_loss(loss: torch.Tensor, clip_value: float = 0.0) -> torch.Tensor:
     if float(clip_value or 0.0) <= 0:
         return loss
-    return torch.clamp(loss, max=float(clip_value))
+    clip = float(clip_value)
+    detached = loss.detach()
+    clipped = torch.clamp(detached, max=clip)
+    scale = torch.clamp(clip / detached.abs().clamp_min(1e-12), max=1.0)
+    return clipped + (loss - detached) * scale
 
 
 _DYNAMIC_HEAD_SCORE_EMA: Dict[str, torch.Tensor] = {}
