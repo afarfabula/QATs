@@ -1,0 +1,18 @@
+{
+  "runs": [
+    "original",
+    "scheme_c"
+  ],
+  "start": 48,
+  "end": 49,
+  "max_samples": 16,
+  "topk": 4,
+  "outputs": [
+    "head_oscillation_summary.tsv",
+    "head_oscillation_summary.json",
+    "recommended_kl_heads.tsv",
+    "avoid_kl_heads.tsv",
+    "checkpoint_pair_metrics.tsv",
+    "analysis_report.md"
+  ]
+}

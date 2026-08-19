@@ -1,0 +1,6 @@
+timestamp	checkpoint	loss	acc1	acc5	samples	delta_vs_80.5980	delta_vs_scheme_c_80.6820	delta_vs_original_80.7240	delta_vs_original_same_ckpt	status
+2026-07-10T15:05:41Z	checkpoint-49	0.8367	80.5580	95.4120	50000	-0.0400	-0.1240	-0.1660	0.0440	below_scheme_c
+2026-07-10T15:05:41Z	checkpoint-50	0.8337	80.5360	95.3680	50000	-0.0620	-0.1460	-0.1880	-0.0940	below_scheme_c
+2026-07-10T15:05:41Z	checkpoint-51	0.8341	80.5940	95.3800	50000	-0.0040	-0.0880	-0.1300	-0.0220	below_scheme_c
+2026-07-10T15:05:41Z	checkpoint-52	0.8381	80.5700	95.3720	50000	-0.0280	-0.1120	-0.1540	-0.1540	below_scheme_c
+2026-07-10T15:05:41Z	checkpoint-53	0.8331	80.5980	95.3720	50000	0.0000	-0.0840	-0.1260	-0.0700	below_scheme_c

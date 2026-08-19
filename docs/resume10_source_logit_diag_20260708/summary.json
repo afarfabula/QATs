@@ -1,0 +1,73 @@
+{
+  "artifacts": {
+    "class_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_source_logit_diag_20260708/class_delta.tsv",
+    "confidence_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_source_logit_diag_20260708/confidence_bins.tsv",
+    "flip_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_source_logit_diag_20260708/flip_cases.tsv",
+    "summary_json": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_source_logit_diag_20260708/summary.json"
+  },
+  "checkpoints": {
+    "nofeat": "/mlx_devbox/users/quyanyi/playground/qat_public_repro/recipe_resume10_vartrust_epoch1_paramsinlate_nofeatout_source_gate_20260708/checkpoint-2.pth.tar",
+    "phase2s": "/mlx_devbox/users/quyanyi/playground/qat_public_repro/recipe_resume10_prerecon_vartrust_selective_gate_20260707/checkpoint-1.pth.tar",
+    "phase2w": "/mlx_devbox/users/quyanyi/playground/qat_public_repro/recipe_resume10_vartrust_epoch1_paramsinlate_gate_20260707/checkpoint-2.pth.tar"
+  },
+  "compare_label": "phase2w",
+  "metrics": {
+    "nofeat": {
+      "loss": 0.8407195432686806,
+      "samples": 50000,
+      "top1": 80.386,
+      "top5": 95.34,
+      "wall_seconds": 66.26948738098145
+    },
+    "phase2s": {
+      "loss": 0.8458985723805428,
+      "samples": 50000,
+      "top1": 80.46,
+      "top5": 95.344,
+      "wall_seconds": 66.96895694732666
+    },
+    "phase2w": {
+      "loss": 0.841315665860176,
+      "samples": 50000,
+      "top1": 80.472,
+      "top5": 95.318,
+      "wall_seconds": 66.31682896614075
+    }
+  },
+  "pair_summaries": [
+    {
+      "avg_margin_delta": 0.015084490180015564,
+      "avg_true_prob_delta": 0.003147296840324998,
+      "cmp": "phase2w",
+      "cmp_top1": 80.472,
+      "delta_top1": 0.012000000000000455,
+      "improved": 372,
+      "improved_true_prob_delta": 0.06224384531378746,
+      "net_flips": 6,
+      "ref": "phase2s",
+      "ref_top1": 80.46,
+      "regressed": 366,
+      "regressed_true_prob_delta": -0.058505501598119736,
+      "same_correct": 39864,
+      "same_wrong": 9398,
+      "samples": 50000
+    },
+    {
+      "avg_margin_delta": -0.0036320348735898733,
+      "avg_true_prob_delta": -0.0003641501534730196,
+      "cmp": "phase2w",
+      "cmp_top1": 80.472,
+      "delta_top1": 0.08599999999999852,
+      "improved": 340,
+      "improved_true_prob_delta": 0.05038613826036453,
+      "net_flips": 43,
+      "ref": "nofeat",
+      "ref_top1": 80.386,
+      "regressed": 297,
+      "regressed_true_prob_delta": -0.05000883340835571,
+      "same_correct": 39896,
+      "same_wrong": 9467,
+      "samples": 50000
+    }
+  ]
+}

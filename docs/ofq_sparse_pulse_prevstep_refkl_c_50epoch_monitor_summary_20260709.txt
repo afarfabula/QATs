@@ -1,0 +1,12 @@
+timestamp=2026-07-10T02:12:25Z
+log=/mlx_devbox/users/quyanyi/playground/train_ofq_resume10_to60_sparse_pulse_prevstep_refkl_c_20260709.log
+output=/mlx_devbox/users/quyanyi/playground/qat_public_repro/ofq_resume10_to60_sparse_pulse_prevstep_refkl_c_20260709
+remote_output=fdbd:dccd:cdc2:1234:0:b8:::/tmp/qat_public_repro/ofq_resume10_to60_sparse_pulse_prevstep_refkl_c_20260709
+log_exists=yes
+output_exists=remote:/tmp/qat_public_repro/ofq_resume10_to60_sparse_pulse_prevstep_refkl_c_20260709
+checkpoint_count=50
+latest_checkpoint=checkpoint-60.pth.tar
+status_tsv=/mlx_devbox/users/quyanyi/playground/QATs/docs/ofq_sparse_pulse_prevstep_refkl_c_50epoch_status_20260709.tsv
+refw_tsv=/mlx_devbox/users/quyanyi/playground/QATs/docs/ofq_sparse_pulse_prevstep_refkl_c_50epoch_refw_20260709.tsv
+best_fullval_line=2026-07-10T02:12:25Z	checkpoint-54	0.8340	80.6820	95.3880	50000	0.0840	above_baseline
+pulse_refw_nonzero_lines=400

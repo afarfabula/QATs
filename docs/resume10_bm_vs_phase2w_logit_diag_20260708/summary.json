@@ -1,0 +1,48 @@
+{
+  "artifacts": {
+    "class_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_bm_vs_phase2w_logit_diag_20260708/class_delta.tsv",
+    "confidence_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_bm_vs_phase2w_logit_diag_20260708/confidence_bins.tsv",
+    "flip_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_bm_vs_phase2w_logit_diag_20260708/flip_cases.tsv",
+    "summary_json": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_bm_vs_phase2w_logit_diag_20260708/summary.json"
+  },
+  "checkpoints": {
+    "phase2bm_fc2actmse": "/mlx_devbox/users/quyanyi/playground/qat_public_repro/recipe_resume10_vartrust_epoch1_paramsinlate_fc2actmse_source_gate_20260708/checkpoint-2.pth.tar",
+    "phase2w": "/mlx_devbox/users/quyanyi/playground/qat_public_repro/recipe_resume10_vartrust_epoch1_paramsinlate_gate_20260707/checkpoint-2.pth.tar"
+  },
+  "compare_label": "phase2w",
+  "metrics": {
+    "phase2bm_fc2actmse": {
+      "loss": 0.8404808954358101,
+      "samples": 50000,
+      "top1": 80.472,
+      "top5": 95.322,
+      "wall_seconds": 66.05676293373108
+    },
+    "phase2w": {
+      "loss": 0.841315665860176,
+      "samples": 50000,
+      "top1": 80.472,
+      "top5": 95.318,
+      "wall_seconds": 66.37595343589783
+    }
+  },
+  "pair_summaries": [
+    {
+      "avg_margin_delta": -0.0008353318553417921,
+      "avg_true_prob_delta": -0.00024754818878136575,
+      "cmp": "phase2w",
+      "cmp_top1": 80.472,
+      "delta_top1": 0.0,
+      "improved": 347,
+      "improved_true_prob_delta": 0.05453631281852722,
+      "net_flips": 0,
+      "ref": "phase2bm_fc2actmse",
+      "ref_top1": 80.472,
+      "regressed": 347,
+      "regressed_true_prob_delta": -0.05678411200642586,
+      "same_correct": 39889,
+      "same_wrong": 9417,
+      "samples": 50000
+    }
+  ]
+}

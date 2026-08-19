@@ -1,0 +1,2 @@
+timestamp	epoch	acc1	acc5	checkpoint	ckpt_bytes	state
+2026-07-03T15:06:59Z	NA	NA	NA	NA	NA	alive=True latest_train=[2, 100, 625]

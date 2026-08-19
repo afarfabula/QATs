@@ -1,0 +1,13 @@
+timestamp=2026-07-10T10:43:20Z
+log=/mlx_devbox/users/quyanyi/playground/train_ofq_resume10_to60_original_ofq_public_20260710.log
+remote_output=fdbd:dccd:cdc2:1234:0:b8:::/tmp/qat_public_repro/ofq_resume10_to60_original_ofq_public_20260710
+log_exists=yes
+output_exists=remote:/tmp/qat_public_repro/ofq_resume10_to60_original_ofq_public_20260710
+checkpoint_count=50
+latest_checkpoint=checkpoint-60.pth.tar
+status_tsv=/mlx_devbox/users/quyanyi/playground/QATs/docs/ofq_resume10_to60_original_ofq_public_status_20260710.tsv
+refw_tsv=/mlx_devbox/users/quyanyi/playground/QATs/docs/ofq_resume10_to60_original_ofq_public_refw_20260710.tsv
+best_fullval_line=2026-07-10T10:43:20Z	checkpoint-52	0.8369	80.7240	95.3400	50000	0.1260	0.0420	above_baseline
+above_baseline_lines=6
+above_scheme_c_lines=1
+nonzero_refw_lines=0

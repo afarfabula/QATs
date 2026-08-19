@@ -1,0 +1,15 @@
+timestamp=2026-07-10T15:05:41Z
+log=/mlx_devbox/users/quyanyi/playground/train_ofq_resume48_to60_singlepulse52_refkl_gate_20260710.log
+remote_output=fdbd:dccd:cdc2:1234:0:b8:::/tmp/qat_public_repro/ofq_resume48_to60_singlepulse52_refkl_gate_20260710
+log_exists=yes
+output_exists=remote:/tmp/qat_public_repro/ofq_resume48_to60_singlepulse52_refkl_gate_20260710
+checkpoint_count=5
+latest_checkpoint=checkpoint-53.pth.tar
+status_tsv=/mlx_devbox/users/quyanyi/playground/QATs/docs/ofq_resume48_to60_singlepulse52_refkl_gate_status_20260710.tsv
+refw_tsv=/mlx_devbox/users/quyanyi/playground/QATs/docs/ofq_resume48_to60_singlepulse52_refkl_gate_refw_20260710.tsv
+best_fullval_line=2026-07-10T15:05:41Z	checkpoint-53	0.8331	80.5980	95.3720	50000	0.0000	-0.0840	-0.1260	-0.0700	below_scheme_c
+above_baseline_lines=0
+above_scheme_c_lines=0
+above_original_lines=0
+nonzero_refw_lines=50
+nonzero_refw_epochs=52

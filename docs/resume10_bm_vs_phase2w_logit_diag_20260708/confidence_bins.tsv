@@ -1,0 +1,9 @@
+pair	ref_conf_bin	total	ref_correct	cmp_correct	improved	regressed	net_flips	avg_true_prob_delta
+phase2w_vs_phase2bm_fc2actmse	[0.00,0.20)	1385	280	286	68	62	6	0.0019263209542259574
+phase2w_vs_phase2bm_fc2actmse	[0.20,0.40)	4273	1622	1622	172	172	0	0.0015036260010674596
+phase2w_vs_phase2bm_fc2actmse	[0.40,0.60)	6660	3812	3808	107	111	-4	0.0009608611580915749
+phase2w_vs_phase2bm_fc2actmse	[0.60,0.80)	9353	7295	7293	0	2	-2	-0.00021944980835542083
+phase2w_vs_phase2bm_fc2actmse	[0.80,0.90)	15399	14565	14565	0	0	0	-0.0002270604600198567
+phase2w_vs_phase2bm_fc2actmse	[0.90,0.95)	10865	10637	10637	0	0	0	-0.0017673135735094547
+phase2w_vs_phase2bm_fc2actmse	[0.95,0.99)	2015	1976	1976	0	0	0	-0.0015436048852279782
+phase2w_vs_phase2bm_fc2actmse	[0.99,1.01)	50	49	49	0	0	0	-0.00016897282330319285

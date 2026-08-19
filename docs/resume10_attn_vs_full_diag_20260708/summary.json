@@ -1,0 +1,48 @@
+{
+  "artifacts": {
+    "class_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_attn_vs_full_diag_20260708/class_delta.tsv",
+    "confidence_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_attn_vs_full_diag_20260708/confidence_bins.tsv",
+    "flip_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_attn_vs_full_diag_20260708/flip_cases.tsv",
+    "summary_json": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_attn_vs_full_diag_20260708/summary.json"
+  },
+  "checkpoints": {
+    "attn250": "/mlx_devbox/users/quyanyi/playground/qat_public_repro/recipe_resume10_paramsinlate_attn55_71_250upd_gate_20260708/checkpoint-3.pth.tar",
+    "full250": "/mlx_devbox/users/quyanyi/playground/qat_public_repro/recipe_resume10_paramsinlate_ckpt2_250upd_gate_20260708/checkpoint-3.pth.tar"
+  },
+  "compare_label": "full250",
+  "metrics": {
+    "attn250": {
+      "loss": 0.8395628742432595,
+      "samples": 50000,
+      "top1": 80.458,
+      "top5": 95.366,
+      "wall_seconds": 66.84022617340088
+    },
+    "full250": {
+      "loss": 0.8394721623587609,
+      "samples": 50000,
+      "top1": 80.494,
+      "top5": 95.314,
+      "wall_seconds": 66.15822005271912
+    }
+  },
+  "pair_summaries": [
+    {
+      "avg_margin_delta": -0.002640092745423317,
+      "avg_true_prob_delta": -0.00030762262758798897,
+      "cmp": "full250",
+      "cmp_top1": 80.494,
+      "delta_top1": 0.036000000000001364,
+      "improved": 355,
+      "improved_true_prob_delta": 0.052820123732089996,
+      "net_flips": 18,
+      "ref": "attn250",
+      "ref_top1": 80.458,
+      "regressed": 337,
+      "regressed_true_prob_delta": -0.050831712782382965,
+      "same_correct": 39892,
+      "same_wrong": 9416,
+      "samples": 50000
+    }
+  ]
+}

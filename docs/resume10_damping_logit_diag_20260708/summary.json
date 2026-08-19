@@ -1,0 +1,98 @@
+{
+  "artifacts": {
+    "class_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_damping_logit_diag_20260708/class_delta.tsv",
+    "confidence_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_damping_logit_diag_20260708/confidence_bins.tsv",
+    "flip_tsv": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_damping_logit_diag_20260708/flip_cases.tsv",
+    "summary_json": "/mlx_devbox/users/quyanyi/playground/QATs/docs/resume10_damping_logit_diag_20260708/summary.json"
+  },
+  "checkpoints": {
+    "best250": "/mlx_devbox/users/quyanyi/playground/qat_public_repro/recipe_resume10_paramsinlate_ckpt2_250upd_gate_20260708/checkpoint-3.pth.tar",
+    "highdrift_damp": "/mlx_devbox/users/quyanyi/playground/qat_public_repro/recipe_resume10_attn55_71_250upd_highdrift_damp05_gate_20260708/checkpoint-3.pth.tar",
+    "movev_damp": "/mlx_devbox/users/quyanyi/playground/qat_public_repro/recipe_resume10_paramsinlate_250upd_movev_damp05_gate_20260708/checkpoint-3.pth.tar",
+    "phase2w": "/mlx_devbox/users/quyanyi/playground/qat_public_repro/recipe_resume10_vartrust_epoch1_paramsinlate_gate_20260707/checkpoint-2.pth.tar"
+  },
+  "compare_label": "best250",
+  "metrics": {
+    "best250": {
+      "loss": 0.8393910246634483,
+      "samples": 50000,
+      "top1": 80.504,
+      "top5": 95.304,
+      "wall_seconds": 65.17773365974426
+    },
+    "highdrift_damp": {
+      "loss": 0.8394331867718696,
+      "samples": 50000,
+      "top1": 80.458,
+      "top5": 95.326,
+      "wall_seconds": 65.0791072845459
+    },
+    "movev_damp": {
+      "loss": 0.8393187568068504,
+      "samples": 50000,
+      "top1": 80.478,
+      "top5": 95.33,
+      "wall_seconds": 65.08616304397583
+    },
+    "phase2w": {
+      "loss": 0.8411786634492874,
+      "samples": 50000,
+      "top1": 80.506,
+      "top5": 95.312,
+      "wall_seconds": 66.13792061805725
+    }
+  },
+  "pair_summaries": [
+    {
+      "avg_margin_delta": 0.0035666467156261206,
+      "avg_true_prob_delta": 0.0008242796175181866,
+      "cmp": "best250",
+      "cmp_top1": 80.504,
+      "delta_top1": -0.001999999999995339,
+      "improved": 355,
+      "improved_true_prob_delta": 0.05515054613351822,
+      "net_flips": -1,
+      "ref": "phase2w",
+      "ref_top1": 80.506,
+      "regressed": 356,
+      "regressed_true_prob_delta": -0.05235479772090912,
+      "same_correct": 39897,
+      "same_wrong": 9392,
+      "samples": 50000
+    },
+    {
+      "avg_margin_delta": -0.0029940661042928696,
+      "avg_true_prob_delta": -0.0004209761100355536,
+      "cmp": "best250",
+      "cmp_top1": 80.504,
+      "delta_top1": 0.04600000000000648,
+      "improved": 348,
+      "improved_true_prob_delta": 0.05146908015012741,
+      "net_flips": 23,
+      "ref": "highdrift_damp",
+      "ref_top1": 80.458,
+      "regressed": 325,
+      "regressed_true_prob_delta": -0.05011630803346634,
+      "same_correct": 39904,
+      "same_wrong": 9423,
+      "samples": 50000
+    },
+    {
+      "avg_margin_delta": -0.0007130343583412468,
+      "avg_true_prob_delta": -0.00015943862672429532,
+      "cmp": "best250",
+      "cmp_top1": 80.504,
+      "delta_top1": 0.02600000000001046,
+      "improved": 317,
+      "improved_true_prob_delta": 0.04896128922700882,
+      "net_flips": 13,
+      "ref": "movev_damp",
+      "ref_top1": 80.478,
+      "regressed": 304,
+      "regressed_true_prob_delta": -0.04925341531634331,
+      "same_correct": 39935,
+      "same_wrong": 9444,
+      "samples": 50000
+    }
+  ]
+}
