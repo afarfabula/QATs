@@ -186,3 +186,33 @@ DEVICES=0,1,2,3,4,5,6,7 MASTER_PORT=31983 \
 
 训练输出默认写到 `/tmp/qat_public_repro/<experiment>/`，日志默认写到 `/mlx_devbox/users/quyanyi/playground/train_<experiment>.log`。如果复现实验，请同时保留日志和对应脚本，便于后续抽取 full-validation 轨迹。
 
+## 大于 50epoch 的全部实验
+
+本节统计 `experiment_logs/fullval_ge10/` 下所有 `playground__train_*.log`，筛选条件是 `Test: [distributed-summary]` full-validation 点数大于 50。`launch_*.nohup.log` 是启动日志副本，不重复计入。下表中的 epoch 使用训练日志里的真实 epoch 编号：resume 类实验从 `10` 或 `200` 开始，而不是从曲线索引 0 重新编号。
+
+### 全量结果表
+
+| 实验 | full-val 点数 | epoch 范围 | 设计细节 | Best Top-1 | Best epoch | Final Top-1 | Last10 avg | 轨迹摘要 |
+|---|---:|---:|---|---:|---:|---:|---:|---|
+| `recipe100ep_e_featnorm_aug_fixed_qkr_softkd_t275_20260705` | 62 | 0-61 | public-family early recipe；feature-output norm MSE，layers=`features.5.5,features.7.1`，weight=`0.005`；soft KD temperature=`2.75`；quant LR multiplier=`4.0`；`min_lr=1e-5`。 | 80.4140 | 59 | 80.4060 | 80.3132 | 0:77.8500, 10:79.1120, 20:79.3400, 30:79.6500, 40:79.9240, 50:80.2380, 60:80.2880 |
+| `ofq_resume10_to110_original_ofq_public_20260711` | 100 | 10-109 | 从 `recipe10ep_e_featnorm_aug_fixed_qkr_softkd_t275_rebuild_20260706/checkpoint-10` resume；不开 KL；`lr=1.5e-5`，`min_lr=5e-6`，`epochs=110`。 | 80.7520 | 101 | 80.6860 | 80.6520 | 10:80.3360, 20:80.4660, 30:80.3800, 40:80.5280, 50:80.5200, 60:80.5280, 70:80.5700, 80:80.5940, 90:80.6400, 100:80.6800, 109:80.6860 |
+| `ofq_resume10_to110_dynamic_sparse_prevstep_refkl_20260710` | 100 | 10-109 | 从同一 checkpoint-10 resume；`ema_ref_attn_kl`；prev-step ref；动态 sparse head，主 head=`custom_subset:8:4`；`lr=1.5e-5`。 | 80.7600 | 99 | 80.6600 | 80.6316 | 10:80.3360, 20:80.4660, 30:80.3800, 40:80.5280, 50:80.5200, 60:80.5280, 70:80.5720, 80:80.6840, 90:80.6460, 100:80.5780, 109:80.6600 |
+| `ofq_resume10_to210_late_sparse_prevstep_refkl_20260712` | 200 | 10-209 | 从 checkpoint-10 resume；`ema_ref_attn_kl`；prev-step ref；late sparse KL，head=`custom_subset:8:4`；`lr=1.5e-5`，长跑到 210。 | 80.8280 | 98 | 80.6140 | 80.6542 | 10:80.2920, 20:80.4980, 30:80.4120, 40:80.5960, 50:80.4500, 60:80.6360, 70:80.6240, 80:80.5300, 90:80.5300, 100:80.6000, 109:80.5580, 149:80.5160, 199:80.5120, 209:80.6140 |
+| `ofq_100ep_fromscratch_original_ofq_public_control_20260714` | 100 | 0-99 | 从 public pretrained 起跑；不开 KL；OFQ public control；`lr=2e-4`，`min_lr=5e-6`，`epochs=100`。 | 80.7920 | 81 | 80.6780 | 80.7086 | 0:77.7080, 10:78.9520, 20:79.3320, 30:79.7980, 40:80.0840, 50:80.2140, 60:80.5080, 70:80.5920, 80:80.6360, 90:80.7320, 99:80.6780 |
+| `ofq_100ep_fromscratch_late_sparse_prevstep_refkl_20260713` | 100 | 0-99 | 从 public pretrained 起跑；`ema_ref_attn_kl`；prev-step ref；late sparse KL，head=`custom_subset:8:4`；`ref_attn_kl_drop_prob=0.50`，`clip=20.0`。 | 80.7720 | 99 | 80.7720 | 80.7316 | 0:77.7080, 10:78.9520, 20:79.3320, 30:79.7980, 40:80.0840, 50:80.2140, 60:80.4040, 70:80.5720, 80:80.6000, 90:80.6780, 99:80.7720 |
+| `ofq_100ep_fromscratch_teacher_sparse_attnkl_fixed_20260803` | 100 | 0-99 | 从 public pretrained 起跑；FP teacher attention-KL；head=`custom_subset:8:4,11:18,6:1`；epoch 5-89 权重主要为 `1e-6/2e-6`；等效 loss 过小，轨迹等同 no-KL。 | 80.7920 | 81 | 80.6780 | 80.7086 | 0:77.7080, 10:78.9520, 20:79.3320, 30:79.7980, 40:80.0840, 50:80.2140, 60:80.5080, 70:80.5920, 80:80.6360, 90:80.7320, 99:80.6780 |
+| `ofq_100ep_fromscratch_teacher_sparse_attnkl_clipgrad_20260804` | 100 | 0-99 | 从 public pretrained 起跑；最新完整 teacher KLD1；FP teacher attention relation；primary heads=`8:4,11:18,6:1`，middle phase 加 `5:7,4:11`；`TeacherAttnKL` clip=`20.0`，weight=`1e-6/2e-6`。 | 80.8180 | 99 | 80.8180 | 80.7166 | 0:77.7080, 10:79.0580, 20:79.4480, 30:79.6880, 40:80.1240, 50:80.2640, 60:80.4560, 70:80.5660, 80:80.5140, 90:80.7400, 99:80.8180 |
+| `ofq_100ep_fromscratch_teacher_sparse_attnkl_latepolish_20260805` | 66 | 0-65 | 从 public pretrained 起跑；teacher KLD1 late-polish 设计；epoch 60 后才打开 teacher attention-KL；当前只跑到 66 个 full-val 点，不是完整 100ep 结论。 | 80.5260 | 59 | 80.4800 | 80.4240 | 0:77.7080, 10:78.9520, 20:79.3320, 30:79.7980, 40:80.0840, 50:80.2140, 60:80.4120 |
+| `ofq_200ep_fromscratch_fixedcycle_group_sparse_prevstep_refkl_20260731` | 200 | 0-199 | 从 public pretrained 起跑；fixed-cycle sparse prev-step KL；heads=`5:7,4:11,8:4`；周期性 ref KL pulse，典型 weight=`1e-5`，clip=`20.0`；当前全仓库最强单 checkpoint。 | 80.8680 | 194 | 80.7080 | 80.7570 | 0:77.6420, 10:78.9320, 20:79.4660, 30:79.4140, 40:79.8720, 50:79.8860, 60:80.0640, 70:80.1600, 80:80.2640, 90:80.3300, 99:80.4060, 109:80.5140, 149:80.6620, 199:80.7080 |
+| `ofq_resume200_to300_fixedcycle_sparse_prevstep_refkl_20260802` | 100 | 200-299 | 从 200epoch fixed-cycle checkpoint-200 resume；继续 fixed-cycle sparse prev-step KL；heads=`5:7,4:11,8:4`；resume 后没有超过源实验 epoch 194 的 `80.8680`。 | 80.8420 | 209 | 80.6900 | 80.7192 | 200:80.6340, 210:80.6900, 220:80.7140, 230:80.6940, 240:80.7200, 250:80.7800, 260:80.7680, 270:80.6780, 280:80.7820, 290:80.7920, 299:80.6900 |
+
+### 设计脉络总结
+
+第一阶段是 public-family recipe 探索，代表是 `recipe100ep_e_featnorm_aug_fixed_qkr_softkd_t275_20260705`。这条线验证了 fixed QKR、soft KD、feature-output norm MSE 和增强策略可以把 100epoch 轨迹推到 `80.4` 左右，但还明显低于后续 OFQ public-family 长跑。
+
+第二阶段是从 `checkpoint-10` 出发的 resume 长跑。no-KL `resume10_to110` 到 `80.7520`，dynamic sparse prev-step KL 到 `80.7600`，差距很小；继续做 `resume10_to210` 后出现 `80.8280` 的更高单点，但末段回落到 `80.6140`，说明这类 late sparse KL 有保峰/冲高价值，但不稳定。
+
+第三阶段转为更干净的 100epoch from-public-pretrained 对照。no-KL best 是 `80.7920`，老 KL best 是 `80.7720`，teacher KLD1 clipgrad best 是 `80.8180`。这组结果说明 public OFQ baseline 本身很强；teacher KLD1 是三条 100epoch 里最高，但增益只有 `+0.0260`，需要更强 loss-scale gate 才能证明 teacher attention relation 是主要原因。
+
+第四阶段是 200epoch fixed-cycle sparse prev-step KL。`ofq_200ep_fromscratch_fixedcycle_group_sparse_prevstep_refkl_20260731` 达到 `80.8680`，是当前最好结果；但 `resume200_to300` 只到 `80.8420`，没有超过源实验最好点，因此继续单纯延长训练不是优先方向。
+
