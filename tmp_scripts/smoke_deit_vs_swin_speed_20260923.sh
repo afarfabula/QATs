@@ -21,6 +21,7 @@ STEPS=${STEPS:-64}
 BATCH=${BATCH:-32}
 WORKERS=${WORKERS:-8}
 PORT=${PORT:-30640}
+NPROC=${NPROC:-1}          # 多卡 DDP：GPU=4,5 NPROC=2
 RUNS=${RUNS:-deit,swin}
 LOGINTERVAL=${LOGINTERVAL:-8}
 TAG=${TAG:-smoke}
@@ -40,7 +41,7 @@ run_one () {
     --teacher "$model" --teacher-type "$mtype" \
     --data "$DATA" --dataset-format folder \
     --output "$OUT" --experiment "${name}_${TAG}_w4a4_bs${BATCH}_${STEPS}step" \
-    --devices "$GPU" --nproc-per-node 1 --master-port "$port" \
+    --devices "$GPU" --nproc-per-node "$NPROC" --master-port "$port" \
     --epochs 1 --scheduler-epochs 1 --batch-size "$BATCH" --workers "$WORKERS" \
     --grad-accum-steps 1 --lr "$lr" --min-lr 1e-5 --weight-decay "$wd" \
     --epoch-checkpoint-interval 10000 --checkpoint-hist 0 \

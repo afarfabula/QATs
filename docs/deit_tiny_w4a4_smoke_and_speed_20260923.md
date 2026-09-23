@@ -139,7 +139,60 @@ attention_relation_ranking_loss(student_attn_info, teacher_attn_info, heads=None
 
 一个已知差异：DeiT 返回 dropout 之前的注意力，Swin 沿用既有实现返回 dropout 之后的（既有 KL 路径一直如此）。
 
-## 7. 复现
+## 7. 分类 logits ranking（最朴素版，先做这个）
+
+模块 `third_party/OFQ/src/logits_ranking.py`：
+
+```python
+logits_ranking_loss(student_logits, teacher_logits, topk=5)   # -> (loss, 有效对数)
+```
+
+规则和 `rank_idea/` 文档里那套一致：取教师分数最高的 top-k 个**类别**，与所有教师分数严格更低的类别组成
+有向对，用 `softplus(-(s_c - s_d))` 要求学生在同样两个类别上保持同样顺序；并列的对不计入；先按样本对有效对
+取平均，再对样本取平均。DeiT 蒸馏模型训练时返回 `(cls, dist)`，这里取 `cls`（与仓库既有 KD 辅助函数一致）。
+
+```bash
+--logit-rank-weight 1.0     # 需要 KD（teacher 才有 logits），权重为 0 时完全不生效
+--logit-rank-topk 5         # 默认 5
+```
+
+日志多一列 `LogitRank: x (avg)`，并打印一次 `Logits-ranking debug: ... valid_pairs=...`。
+
+验证：
+
+- 单元级：同序 0.151 / 反序 2.484；C=6 时 top-5 每样本 15 对、top-1 每样本 5 对、top-2 每样本 9 对；并列被排除；
+  梯度对高排名类别为负、低排名为正；传 `(cls, dist)` 元组也正常。
+- 端到端：DeiT 与 Swin 各 400 步（bs32，`--logit-rank-weight 1.0`）都跑通，
+  `valid_pairs=159,510`（= 4,985 对/样本 × 32）与 `159,509`（Swin 有极少数并列），
+  `LogitRank` 分别从 0.777→0.484、0.700→0.241 下降。
+- 开销：同一时段 A/B（DeiT bs32）基线 0.228 vs +ranking 0.231 s/step = **+1.3%**；Swin 0.331 vs 0.336 = +1.5%。
+  张量只有 `[B, k, C] ≈ 1.6e5` 个元素，可以认为几乎免费。
+  （注意：跨时段比较不能用于判开销——同配置基线在同一天里从 0.137 漂到 0.228 s/step，是共用节点被别人占满导致的。）
+
+## 8. 100 epoch 时长估算
+
+口径：ImageNet-1k train 1,281,167 张/epoch；本机单卡实测（bs32/卡、KD、W4A4、QK-reparam、bf16）
+DeiT-Tiny 0.137 s/step = 234 img/s、Swin-T 0.331 s/step = 97 img/s；多卡按本机实测的 DDP 近线性
+（2 卡 1.9×，运行手册 §9）外推；不含每 epoch 的 50k 全量验证（8 卡下约 +30 min/100ep，单卡约 +3.5 h/100ep）。
+
+| 卡数 | DeiT 单 epoch | DeiT 100 epoch | Swin 单 epoch | Swin 100 epoch |
+|---:|---:|---:|---:|---:|
+| 1 | 1.5 h | **6.4 天** | 3.7 h | **15.3 天** |
+| 2 | 48 min | 3.3 天 | 1.9 h | 8.1 天 |
+| 4 | 25 min | 1.7 天 | 1.0 h | 4.1 天 |
+| 8 | 12 min | **20 h** | 30 min | **50 h** |
+
+注意这是"算力口径"。本机是多人共用的 8×3090 节点，实测长期平均会被数据流水线停顿拉高：运行手册 §9 里
+4 卡的 2-epoch 复现是 2.2 h/epoch（同口径算力估计只有 1.0 h/epoch），即本机现实系数约 2×。
+按这个系数，8 卡 100 epoch 大约是 DeiT 30~44 h、Swin 75~110 h；单卡则分别约 6~12 天和 15~30 天。
+
+同一张卡上同配置的相对波动可以很大：今天从空闲时的 0.137 s/step（DeiT bs32）漂到别人把 2/5/6/7 号卡占满时的
+0.228 s/step（+66%）。所以下面这张表按"能拿到空闲卡"来读，抢不到卡时按 1.5~2× 折算。
+
+DeiT 还能吃更大 batch 换吞吐（单卡 bs64 实测 339 img/s、bs128 稳定段 401 img/s，Swin bs64 在 24GB 上 OOM），
+所以 8 卡 bs64 时 DeiT 的 100 epoch 算力口径可以压到 ~14 h。
+
+## 9. 复现
 
 ```bash
 cd /home_ext/quyanyi/tiger/resume_repos/QATs
