@@ -1440,7 +1440,7 @@ def main(local_rank, args):
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
 
-            train_metrics, local_update_count, stopped_early = train_one_epoch(
+            train_metrics, total_update_count, stopped_early = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema,
@@ -1543,7 +1543,7 @@ def main(local_rank, args):
 
             if stopped_early:
                 if args.local_rank == 0:
-                    _logger.info(f'Stopped early after {local_update_count} optimizer updates in epoch {epoch}.')
+                    _logger.info(f'Stopped early after {total_update_count} optimizer updates in epoch {epoch}.')
                 break
 
     except KeyboardInterrupt:
@@ -1576,13 +1576,16 @@ def train_one_epoch(
     data_time_m = AverageMeter()
     losses_m = AverageMeter()
     accum_steps = max(1, int(getattr(args, 'grad_accum_steps', 1)))
+    updates_per_epoch = max(1, (len(loader) + accum_steps - 1) // accum_steps)
 
     model.train()
     optimizer.zero_grad()
 
     end = time.time()
     last_idx = len(loader) - 1
-    num_updates = epoch * len(loader)
+    # num_updates counts optimizer updates across the whole run (not micro-batches):
+    # each epoch contributes ceil(len(loader) / accum_steps) optimizer steps.
+    num_updates = epoch * updates_per_epoch
     local_update_count = 0
     saved_step_count = 0
     stopped_early = False
@@ -1773,7 +1776,7 @@ def train_one_epoch(
         if lr_scheduler is not None and update_step:
             lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
 
-        if args.max_train_updates and local_update_count >= args.max_train_updates:
+        if args.max_train_updates and num_updates >= args.max_train_updates:
             stopped_early = True
             break
 
@@ -1782,7 +1785,7 @@ def train_one_epoch(
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
 
-    return OrderedDict([('loss', losses_m.avg)]), local_update_count, stopped_early
+    return OrderedDict([('loss', losses_m.avg)]), num_updates, stopped_early
 
 def setup_alpha(model, loader, args, amp_autocast=suppress):
     model.eval()

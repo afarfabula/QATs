@@ -507,7 +507,7 @@ def build_ofq(args: argparse.Namespace) -> Tuple[List[str], Path, Dict[str, str]
     world_size = count_devices(args.devices, args.nproc_per_node)
     visible_gpu = args.devices or "0"
 
-    dataset_name = "hf-parquet-imagenet" if args.dataset_format != "folder" else "torch/imagenet"
+    dataset_name = "hf-parquet-imagenet" if args.dataset_format != "folder" else "torch/image_folder"
     experiment = args.experiment or f"{model_name}_w{args.wbits or args.bits or 4}a{args.abits or args.bits or 4}_{args.stage}"
 
     command = [
@@ -1256,9 +1256,9 @@ def normalize_optional_string(value: object) -> object:
 
 def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults = {
-        "dataset": "hf-parquet-imagenet" if args.dataset_format != "folder" else "torch/imagenet",
+        "dataset": "hf-parquet-imagenet" if args.dataset_format != "folder" else "torch/image_folder",
         "train_split": "train",
-        "val_split": "validation",
+        "val_split": "val",
         "num_classes": 1000,
         "input_size": None,
         "crop_pct": None,
@@ -1588,7 +1588,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
             "model": args.model or defaults.get("model", "swin_t"),
             "teacher": args.teacher or defaults.get("teacher") or args.model or "swin_t",
             "experiment": args.experiment or defaults.get("experiment") or f"{args.model or 'swin_t'}_w{args.wbits or args.bits or 4}a{args.abits or args.bits or 4}_{args.stage}",
-            "dataset": "hf-parquet-imagenet" if args.dataset_format != "folder" else "torch/imagenet",
+            "dataset": "hf-parquet-imagenet" if args.dataset_format != "folder" else "torch/image_folder",
             "visible_gpu": args.devices or defaults["visible_gpu"],
             "world_size": count_devices(args.devices, args.nproc_per_node),
             "tcp_port": str(args.master_port),
@@ -6256,6 +6256,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     if not hasattr(runtime_args, "_global_train_update"):
         runtime_args._global_train_update = 0
     accum_steps = max(1, int(getattr(runtime_args, "grad_accum_steps", 1)))
+    updates_per_epoch = max(1, (len(loader) + accum_steps - 1) // accum_steps)
     teacher_attn_output_layers = parse_layer_indices(runtime_args.teacher_attn_output_layers)
     teacher_feature_output_layers = parse_name_list(runtime_args.teacher_feature_output_layers)
     teacher_qkv_rel_layers = parse_layer_indices(getattr(runtime_args, "teacher_qkv_rel_layers", "all"))
@@ -6285,7 +6286,10 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     optimizer.zero_grad(set_to_none=True)
     end = time.time()
     last_idx = len(loader) - 1
-    num_updates = epoch * len(loader)
+    # num_updates counts optimizer updates across the whole run; each epoch contributes
+    # ceil(len(loader) / accum_steps) updates (the trailing partial accumulation still steps),
+    # which matches WarmupCosineScheduler's total_updates = scheduler_epochs * updates_per_epoch.
+    num_updates = epoch * updates_per_epoch
     local_update_count = 0
     saved_step_count = 0
     stopped_early = False
@@ -7109,7 +7113,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                     f"Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})"
                 )
 
-        if runtime_args.max_train_updates and local_update_count >= runtime_args.max_train_updates:
+        if runtime_args.max_train_updates and num_updates >= runtime_args.max_train_updates:
             stopped_early = True
             break
         end = time.time()
@@ -7123,7 +7127,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
             f"samples_per_step={samples_per_step} samples_per_sec={throughput:.2f}"
         )
 
-    return {"loss": losses_m.avg}, local_update_count, stopped_early
+    return {"loss": losses_m.avg}, num_updates, stopped_early
 
 
 def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
@@ -7816,7 +7820,7 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                 dataset_train.set_epoch(epoch)
             if runtime_args.distributed and hasattr(loader_train, "sampler") and hasattr(loader_train.sampler, "set_epoch"):
                 loader_train.sampler.set_epoch(epoch)
-            train_metrics, local_update_count, stopped_early = train_one_epoch_ofq(
+            train_metrics, total_update_count, stopped_early = train_one_epoch_ofq(
                 epoch,
                 model,
                 loader_train,
@@ -7916,7 +7920,7 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                     stopped_early = True
             if stopped_early:
                 if runtime_args.local_rank == 0:
-                    print(f"Stopped early after {local_update_count} optimizer updates in epoch {epoch}.")
+                    print(f"Stopped early after {total_update_count} optimizer updates in epoch {epoch}.")
                 runtime_args.ref_head_mode = base_ref_head_mode
                 runtime_args.ref_attn_kl_weight = base_ref_attn_kl_weight
                 break
