@@ -83,21 +83,35 @@
 - 离线 attention 震荡分析脚本（`third_party/OFQ/tools/offline_attention_oscillation.py` 与
   `tmp_scripts/analyze_attn_relation_oscillation_*.py`）是 Swin 专用（`SWIN_STAGE_SPECS`），DeiT 要用需另写 probe。
 
-## 6. DeiT 注意力采集 + attention-relation ranking（本次实现）
+## 6. Attention-relation ranking（模块化，DeiT 与 Swin 共用）
 
-两处改动，都很小：
+### 6.1 模块
 
-1. **DeiT 注意力可被采集**：`src/deit_vision_transformer.py` 的 `Attention` 增加 `collect_attention` 开关与
-   `select_attention_heads()`（支持 `collect_attention_head_indices` 的 head 子集），`Block.forward` 在开关打开时把
-   注意力一起返回；`src/quantization/modules/attention.py` 的四个量化注意力（含 `QAttention_qkreparam`）在
-   `collect_attention` 打开时返回量化后的 softmax 注意力，不再恒为 `None`。
-   `qat_launch.py` 里 `is_attention_module()` / `set_selected_attention_heads()` / `enable_attention_collection()`
-   原先只认 Swin，现在也认 DeiT。
-2. **新增 attention-relation ranking 损失**（`attention_relation_ranking_loss()`）：教师在每个 (head, query) 行内取
-   top-k 个 key，与所有教师分数严格更低的 key 组成有向对，用 `softplus(-(log s_c - log s_d))` 要求学生保持同样顺序；
-   log 概率差等于 softmax 前的分数差，所以等价于约束 QK 分数的大小关系。教师只提供顺序，不提供数值。
+损失本体在 `third_party/OFQ/src/attn_relation_ranking.py`，**与模型无关**，只要求 attention module 在
+`collect_attention` 打开时返回 softmax 后的注意力 `[*, heads, tokens, tokens]`：
 
-用法（默认关闭，`--attn-rank-weight` 为 0 时完全不生效）：
+```python
+attention_relation_ranking_loss(student_attn_info, teacher_attn_info, heads=None, topk=1)
+# heads=None 用全部 (layer, head)，或传 ((layer_idx, head_idx), ...)
+# 返回 (loss, 有效对数)
+```
+
+规则：教师在每个 (layer, head, query) 行内取 top-k 个 key，与所有教师分数严格更低的 key 组成有向对，
+用 `softplus(-(log s_c - log s_d))` 要求学生保持同样顺序。log 概率差等于 softmax 前的分数差，所以等价于
+约束 QK 分数的大小关系；教师只给顺序不给数值，教师值 ≤ 0（mask / dropout）与并列的对都排除。
+
+模型侧只需保证注意力能被采集：
+
+- **Swin**：本来就有（`ShiftedWindowAttention` / `QAttention_swin*` 的 `collect_attention`），未改。
+- **DeiT**：本次补上。`src/deit_vision_transformer.py` 的 `Attention` 增加 `collect_attention` 与
+  `select_attention_heads()`，`Block.forward` 采集时返回注意力；`src/quantization/modules/attention.py` 的四个量化
+  注意力（含 `QAttention_qkreparam`）在 `collect_attention` 打开时返回量化后的 softmax 注意力。
+  `qat_launch.py` 的 `is_attention_module()` / `set_selected_attention_heads()` / `enable_attention_collection()`
+  原先只认 Swin，现在也认 DeiT。
+
+### 6.2 用法
+
+默认关闭，`--attn-rank-weight` 为 0 时完全不生效（也不会打开注意力采集）：
 
 ```bash
 --attn-rank-weight 1.0              # >0 才会自动打开 student/teacher 的注意力采集
@@ -108,17 +122,22 @@
 训练日志会打印一次 `Attention-relation ranking debug: ... valid_pairs=...`（用来确认真的拿到注意力、不是静默 0），
 每个 log 区间里多一列 `AttnRank: x (avg)`。
 
-### 6.1 速度影响（DeiT-Tiny bs32，400 updates，同一张卡）
+### 6.3 速度影响（bs32，400 updates，同一张卡）
 
-| 配置 | 稳态 median s/step | 稳态 img/s | 整段 avg_step_time |
-|---|---:|---:|---:|
-| 不开 ranking（本次改动前） | 0.144 | 222 | 0.189 |
-| 不开 ranking（本次改动后） | 0.137 | 234 | 0.195 |
-| ranking，全部 36 个 head | 0.179 | 178 | 0.202 |
-| ranking，5 个 head（`custom_subset`） | 0.150 | 213 | 0.191 |
+| 模型 | 配置 | 稳态 median s/step | 稳态 img/s | 有效对/step |
+|---|---|---:|---:|---:|
+| DeiT-Tiny | 不开 ranking | 0.137 | 234 | — |
+| DeiT-Tiny | ranking，全 head | 0.179（+30%） | 178 | 44,928,813 |
+| DeiT-Tiny | ranking，5 个 head | 0.150（+9%） | 213 | 6,240,301 |
+| Swin-T | 不开 ranking | 0.331 | 97 | — |
+| Swin-T | ranking，全 head | 0.500（+51%） | 64 | 68,640,466 |
+| Swin-T | ranking，5 个 head | 0.338（+2%） | 95 | 1,505,267 |
 
-结论：默认关闭时开销可忽略；全 head 打开约 +30% 单步（仍是 Swin-T bs32 的 1.85×），限定 head 后约 +9%。
-DeiT 注意力形状是 `[B, 3, 198, 198]`（每行 198 个 key），比 Swin 窗口内的 49 大 4 倍，所以 head/layer 要按需限制。
+结论：默认关闭时开销可忽略；全 head 打开比较贵（DeiT +30%、Swin +51%），用 `--ref-head-mode custom_subset:...`
+限定 5 个 head 后基本回到基线（+9% / +2%）。DeiT 的注意力是 `[B, 3, 198, 198]`（每行 198 个 key），Swin 是
+`[B*num_windows, heads, 49, 49]`，两者成对规模都随 head 数线性变化，所以 head 选择是这个损失唯一需要调的性能旋钮。
+
+一个已知差异：DeiT 返回 dropout 之前的注意力，Swin 沿用既有实现返回 dropout 之后的（既有 KL 路径一直如此）。
 
 ## 7. 复现
 

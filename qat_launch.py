@@ -845,8 +845,10 @@ def load_ofq_training_module():
         KLTokenMSELoss,
     )
     from src.quantization.modules.utils import replace_module_by_qmodule_deit, replace_module_by_qmodule_swin
+    from src.attn_relation_ranking import attention_relation_ranking_loss
 
     _OFQ_TRAIN_MODULE = SimpleNamespace(
+        attention_relation_ranking_loss=attention_relation_ranking_loss,
         KDLossSoftandHard=KDLossSoftandHard,
         KDLossSoftandHard_qk=KDLossSoftandHard_qk,
         KDLossSoftandHard_qkv=KDLossSoftandHard_qkv,
@@ -5263,69 +5265,6 @@ def attention_teacher_agree_consistency_loss(student_attn_info, ref_attn_info, t
     return ref_losses[selected_idx].mean()
 
 
-def attention_relation_ranking_loss(student_attn_info, teacher_attn_info, head_mode: str = "all", topk: int = 1, eps: float = 1e-8):
-    """把教师注意力的"大小关系"迁移到学生注意力上（教师只给顺序，不给数值）。
-
-    教师在每个 (head, query) 行内取 top-k 个 key，与所有教师分数严格更低的 key 组成有向对,
-    用 softplus(-(log s_c - log s_d)) 要求学生在同样两个 key 上保持同样顺序。
-    log 概率差等于 softmax 前的分数差，所以这等价于约束 QK 分数的大小关系。
-    head_mode 复用 ref_head_mode 的编码（all 或 custom_subset:layer:head,...）。
-    返回 (loss, 有效对数)；没有任何有效对时返回 0。
-    """
-    student_list = extract_attn_prob_list(student_attn_info)
-    teacher_list = extract_attn_prob_list(teacher_attn_info)
-    if not student_list or not teacher_list:
-        return torch.zeros((), device="cuda"), 0
-
-    selected_heads = parse_ref_head_mode(head_mode)
-    if selected_heads is None:
-        selected_heads = tuple(
-            (layer_idx, head_idx)
-            for layer_idx, attn in enumerate(student_list)
-            if torch.is_tensor(attn)
-            for head_idx in range(attn.shape[1])
-        )
-
-    total = None
-    used_heads = 0
-    pair_count_total = 0
-    for layer_idx, head_idx in selected_heads:
-        if layer_idx >= len(student_list) or layer_idx >= len(teacher_list):
-            continue
-        student_attn, teacher_attn = student_list[layer_idx], teacher_list[layer_idx]
-        if not torch.is_tensor(student_attn) or not torch.is_tensor(teacher_attn) or student_attn.ndim < 4:
-            continue
-        if head_idx is None or head_idx >= student_attn.shape[1] or head_idx >= teacher_attn.shape[1]:
-            continue
-        k = min(int(topk), teacher_attn.shape[-1] - 1)
-        if k < 1:
-            continue
-
-        student_head = student_attn[:, head_idx]                       # [B, Q, K]
-        teacher_head = teacher_attn[:, head_idx].detach().float()      # [B, Q, K]
-        top_values, top_indices = teacher_head.topk(k, dim=-1)         # [B, Q, k]
-        teacher_keys = teacher_head.unsqueeze(-2)
-        valid = (top_values.unsqueeze(-1) > teacher_keys) & (teacher_keys > 0)   # 忽略 ties 与 0（mask/dropout）
-        pair_count = valid.sum(dim=(-1, -2))                           # [B, Q]
-        rows = pair_count > 0
-        if not bool(rows.any()):
-            continue
-
-        delta = (
-            torch.log(student_head.gather(-1, top_indices).clamp_min(eps)).unsqueeze(-1)
-            - torch.log(student_head.clamp_min(eps)).unsqueeze(-2)
-        )                                                              # [B, Q, k, K]
-        per_row = (F.softplus(-delta) * valid).sum(dim=(-1, -2)) / pair_count.clamp_min(1)
-        head_loss = per_row[rows].mean()
-        total = head_loss if total is None else total + head_loss
-        used_heads += 1
-        pair_count_total += int(pair_count.sum())
-
-    if total is None:
-        return torch.zeros((), device="cuda"), 0
-    return total / used_heads, pair_count_total
-
-
 def logits_kl_consistency_loss(student_logits: torch.Tensor, ref_logits: torch.Tensor, temperature: float = 2.0) -> torch.Tensor:
     temp = max(float(temperature), 1e-6)
     student_log_prob = F.log_softmax(student_logits / temp, dim=-1)
@@ -6348,6 +6287,11 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     capture_act_bin_margin = runtime_args.act_bin_margin_weight > 0
     logged_teacher_attn_kl_debug = False
     logged_attn_rank_debug = False
+    attn_rank_loss_fn = (
+        load_ofq_training_module().attention_relation_ranking_loss
+        if runtime_args.attn_rank_weight > 0
+        else None
+    )
     if runtime_args.local_rank == 0 and teacher is not None and teacher_feature_output_layers and runtime_args.teacher_feature_output_weight > 0:
         print(
             "Teacher feature-output hooks: "
@@ -6812,11 +6756,11 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                         components=runtime_args.teacher_qkv_rel_components,
                     )
                     loss = loss + runtime_args.teacher_qkv_rel_weight * teacher_qk_rel_loss
-                if runtime_args.attn_rank_weight > 0 and teacher_attn_info is not None:
-                    attn_rank_loss, attn_rank_pairs = attention_relation_ranking_loss(
+                if attn_rank_loss_fn is not None and teacher_attn_info is not None:
+                    attn_rank_loss, attn_rank_pairs = attn_rank_loss_fn(
                         student_attn_info,
                         teacher_attn_info,
-                        head_mode=runtime_args.ref_head_mode,
+                        heads=parse_ref_head_mode(runtime_args.ref_head_mode),
                         topk=runtime_args.attn_rank_topk,
                     )
                     loss = loss + runtime_args.attn_rank_weight * attn_rank_loss
