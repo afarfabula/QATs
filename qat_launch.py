@@ -1604,6 +1604,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["batch_size"] = args.batch_size
     if args.workers is not None:
         defaults["workers"] = args.workers
+    if args.num_aug_repeats is not None:
+        defaults["num_aug_repeats"] = args.num_aug_repeats
     if args.lr is not None:
         defaults["lr"] = args.lr
     if args.weight_decay is not None:
@@ -2067,6 +2069,14 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["epochs"] = int(defaults["epochs"])
     defaults["batch_size"] = int(defaults["batch_size"])
     defaults["workers"] = int(defaults["workers"])
+    defaults["num_aug_repeats"] = int(defaults.get("num_aug_repeats", 0) or 0)
+    if defaults["num_aug_repeats"] > 0 and defaults["world_size"] <= 1:
+        # timm 的 create_loader 只在分布式(RepeatAugSampler)下支持 num_aug_repeats != 0
+        print(
+            f"[QATs] num_aug_repeats={defaults['num_aug_repeats']} 需要分布式运行，"
+            f"world_size={defaults['world_size']} 下强制置 0（配置/CLI 里的值被忽略）"
+        )
+        defaults["num_aug_repeats"] = 0
     defaults["grad_accum_steps"] = int(defaults["grad_accum_steps"])
     defaults["forward_micro_batch_size"] = int(defaults.get("forward_micro_batch_size", 0) or 0)
     defaults["warmup_epochs"] = int(defaults["warmup_epochs"])
@@ -8214,6 +8224,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size-eval", dest="batch_size_eval", type=int)
     parser.add_argument("--forward-micro-batch-size", dest="forward_micro_batch_size", type=int, default=None, help="split each train batch into micro forwards with gradient accumulation")
     parser.add_argument("--workers", type=int)
+    parser.add_argument("--num-aug-repeats", dest="num_aug_repeats", type=int, help="repeated augmentation 的重复次数；timm 只在分布式(DDP)下支持非 0 值")
     parser.add_argument("--lr", type=float)
     parser.add_argument("--weight-decay", dest="weight_decay", type=float)
     parser.add_argument("--warmup-epochs", dest="warmup_epochs", type=int)
