@@ -24,6 +24,7 @@ PORT=${PORT:-30640}
 RUNS=${RUNS:-deit,swin}
 LOGINTERVAL=${LOGINTERVAL:-8}
 TAG=${TAG:-smoke}
+EXTRA=${EXTRA:-}   # 追加到 qat_launch.py 的额外参数，例如 EXTRA="--attn-rank-weight 1.0"
 
 mkdir -p "$LOGDIR" "$OUT"
 
@@ -51,6 +52,7 @@ run_one () {
     --extra-arg=--max_train_updates --extra-arg="$STEPS" \
     --extra-arg=--log-interval --extra-arg="$LOGINTERVAL" \
     --extra-arg=--seed --extra-arg=42 \
+    $EXTRA \
     > "$log" 2>&1
   echo "[smoke] $name exit=$? log=$log"
 }

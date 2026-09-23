@@ -939,6 +939,8 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--teacher-attn-kl-weight", dest="teacher_attn_kl_weight", type=float)
     parser.add_argument("--teacher-attn-kl-warmup-epochs", dest="teacher_attn_kl_warmup_epochs", type=int)
     parser.add_argument("--teacher-attn-kl-weight-epoch-overrides", dest="teacher_attn_kl_weight_epoch_overrides", type=str)
+    parser.add_argument("--attn-rank-weight", dest="attn_rank_weight", type=float)
+    parser.add_argument("--attn-rank-topk", dest="attn_rank_topk", type=int)
     parser.add_argument("--ref-head-mode-epoch-overrides", dest="ref_head_mode_epoch_overrides", type=str)
     parser.add_argument("--teacher-attn-output-weight", dest="teacher_attn_output_weight", type=float)
     parser.add_argument("--teacher-attn-output-layers", dest="teacher_attn_output_layers", type=str)
@@ -1391,6 +1393,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "teacher_attn_kl_weight": 0.0,
         "teacher_attn_kl_warmup_epochs": 0,
         "teacher_attn_kl_weight_epoch_overrides": "",
+        "attn_rank_weight": 0.0,
+        "attn_rank_topk": 1,
         "teacher_attn_output_weight": 0.0,
         "teacher_attn_output_layers": "all",
         "teacher_attn_output_warmup_epochs": 0,
@@ -1722,6 +1726,10 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["teacher_attn_kl_warmup_epochs"] = args.teacher_attn_kl_warmup_epochs
     if getattr(args, "teacher_attn_kl_weight_epoch_overrides", None) is not None:
         defaults["teacher_attn_kl_weight_epoch_overrides"] = args.teacher_attn_kl_weight_epoch_overrides
+    if getattr(args, "attn_rank_weight", None) is not None:
+        defaults["attn_rank_weight"] = args.attn_rank_weight
+    if getattr(args, "attn_rank_topk", None) is not None:
+        defaults["attn_rank_topk"] = args.attn_rank_topk
     if args.teacher_attn_output_weight is not None:
         defaults["teacher_attn_output_weight"] = args.teacher_attn_output_weight
     if args.teacher_attn_output_layers is not None:
@@ -2117,6 +2125,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["teacher_attn_kl_weight"] = float(defaults["teacher_attn_kl_weight"])
     defaults["teacher_attn_kl_warmup_epochs"] = int(defaults["teacher_attn_kl_warmup_epochs"])
     defaults["teacher_attn_kl_weight_epoch_overrides"] = parse_epoch_float_overrides(defaults.get("teacher_attn_kl_weight_epoch_overrides"))
+    defaults["attn_rank_weight"] = float(defaults.get("attn_rank_weight", 0.0) or 0.0)
+    defaults["attn_rank_topk"] = int(defaults.get("attn_rank_topk", 1) or 1)
     defaults["teacher_attn_output_weight"] = float(defaults["teacher_attn_output_weight"])
     defaults["teacher_attn_output_layers"] = str(defaults.get("teacher_attn_output_layers", "all"))
     defaults["teacher_attn_output_warmup_epochs"] = int(defaults["teacher_attn_output_warmup_epochs"])
@@ -2518,8 +2528,7 @@ def get_ofq_qat_model(model: nn.Module, runtime_args: SimpleNamespace) -> nn.Mod
 def enable_attention_collection(model: nn.Module) -> int:
     enabled = 0
     for module in model.modules():
-        module_name = type(module).__name__
-        if module_name == "ShiftedWindowAttention" or module_name.startswith("QAttention_swin"):
+        if hasattr(module, "collect_attention") or is_attention_module(module):
             setattr(module, "collect_attention", True)
             enabled += 1
     return enabled
@@ -2548,6 +2557,7 @@ def create_ofq_teacher_model(runtime_args: SimpleNamespace) -> nn.Module:
         runtime_args.teacher_attn_kl_weight > 0
         or has_positive_epoch_override(getattr(runtime_args, "teacher_attn_kl_weight_epoch_overrides", None))
         or runtime_args.teacher_qk_rel_weight > 0
+        or getattr(runtime_args, "attn_rank_weight", 0.0) > 0
         or str(getattr(runtime_args, "ref_head_mode", "")).startswith("dynamic_teacher_agree_top")
     ):
         set_attention_mode(teacher, collect_attention=True, qqkkvv=qqkkvv)
@@ -2788,7 +2798,7 @@ def set_attention_mode(model: nn.Module, collect_attention: bool = False, qqkkvv
 
 def is_attention_module(module: nn.Module) -> bool:
     module_name = type(module).__name__
-    return module_name == "ShiftedWindowAttention" or module_name.startswith("QAttention_swin")
+    return module_name in {"ShiftedWindowAttention", "Attention"} or module_name.startswith("QAttention")
 
 
 def parse_layer_indices(spec: str) -> Optional[Tuple[int, ...]]:
@@ -3049,9 +3059,7 @@ def set_selected_attention_heads(model: nn.Module, head_map: Optional[Dict[int, 
 
     layer_idx = 0
     for module in model.modules():
-        module_name = type(module).__name__
-        is_swin_attention = module_name == "ShiftedWindowAttention" or module_name.startswith("QAttention_swin")
-        if not is_swin_attention:
+        if not is_attention_module(module):
             continue
         heads = tuple(sorted(set(int(head) for head in head_map.get(layer_idx, ()))))
         setattr(module, "collect_attention_head_indices", heads)
@@ -5255,6 +5263,69 @@ def attention_teacher_agree_consistency_loss(student_attn_info, ref_attn_info, t
     return ref_losses[selected_idx].mean()
 
 
+def attention_relation_ranking_loss(student_attn_info, teacher_attn_info, head_mode: str = "all", topk: int = 1, eps: float = 1e-8):
+    """把教师注意力的"大小关系"迁移到学生注意力上（教师只给顺序，不给数值）。
+
+    教师在每个 (head, query) 行内取 top-k 个 key，与所有教师分数严格更低的 key 组成有向对,
+    用 softplus(-(log s_c - log s_d)) 要求学生在同样两个 key 上保持同样顺序。
+    log 概率差等于 softmax 前的分数差，所以这等价于约束 QK 分数的大小关系。
+    head_mode 复用 ref_head_mode 的编码（all 或 custom_subset:layer:head,...）。
+    返回 (loss, 有效对数)；没有任何有效对时返回 0。
+    """
+    student_list = extract_attn_prob_list(student_attn_info)
+    teacher_list = extract_attn_prob_list(teacher_attn_info)
+    if not student_list or not teacher_list:
+        return torch.zeros((), device="cuda"), 0
+
+    selected_heads = parse_ref_head_mode(head_mode)
+    if selected_heads is None:
+        selected_heads = tuple(
+            (layer_idx, head_idx)
+            for layer_idx, attn in enumerate(student_list)
+            if torch.is_tensor(attn)
+            for head_idx in range(attn.shape[1])
+        )
+
+    total = None
+    used_heads = 0
+    pair_count_total = 0
+    for layer_idx, head_idx in selected_heads:
+        if layer_idx >= len(student_list) or layer_idx >= len(teacher_list):
+            continue
+        student_attn, teacher_attn = student_list[layer_idx], teacher_list[layer_idx]
+        if not torch.is_tensor(student_attn) or not torch.is_tensor(teacher_attn) or student_attn.ndim < 4:
+            continue
+        if head_idx is None or head_idx >= student_attn.shape[1] or head_idx >= teacher_attn.shape[1]:
+            continue
+        k = min(int(topk), teacher_attn.shape[-1] - 1)
+        if k < 1:
+            continue
+
+        student_head = student_attn[:, head_idx]                       # [B, Q, K]
+        teacher_head = teacher_attn[:, head_idx].detach().float()      # [B, Q, K]
+        top_values, top_indices = teacher_head.topk(k, dim=-1)         # [B, Q, k]
+        teacher_keys = teacher_head.unsqueeze(-2)
+        valid = (top_values.unsqueeze(-1) > teacher_keys) & (teacher_keys > 0)   # 忽略 ties 与 0（mask/dropout）
+        pair_count = valid.sum(dim=(-1, -2))                           # [B, Q]
+        rows = pair_count > 0
+        if not bool(rows.any()):
+            continue
+
+        delta = (
+            torch.log(student_head.gather(-1, top_indices).clamp_min(eps)).unsqueeze(-1)
+            - torch.log(student_head.clamp_min(eps)).unsqueeze(-2)
+        )                                                              # [B, Q, k, K]
+        per_row = (F.softplus(-delta) * valid).sum(dim=(-1, -2)) / pair_count.clamp_min(1)
+        head_loss = per_row[rows].mean()
+        total = head_loss if total is None else total + head_loss
+        used_heads += 1
+        pair_count_total += int(pair_count.sum())
+
+    if total is None:
+        return torch.zeros((), device="cuda"), 0
+    return total / used_heads, pair_count_total
+
+
 def logits_kl_consistency_loss(student_logits: torch.Tensor, ref_logits: torch.Tensor, temperature: float = 2.0) -> torch.Tensor:
     temp = max(float(temperature), 1e-6)
     student_log_prob = F.log_softmax(student_logits / temp, dim=-1)
@@ -6253,6 +6324,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     anchor_ref_attn_kl_losses_m = AverageMeter()
     teacher_attn_kl_losses_m = AverageMeter()
     teacher_qk_rel_losses_m = AverageMeter()
+    attn_rank_losses_m = AverageMeter()
     teacher_attn_output_losses_m = AverageMeter()
     teacher_feature_output_losses_m = AverageMeter()
     act_scale_anchor_losses_m = AverageMeter()
@@ -6275,6 +6347,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     act_bin_margin_quantizers = parse_name_list(getattr(runtime_args, "act_bin_margin_quantizers", ""))
     capture_act_bin_margin = runtime_args.act_bin_margin_weight > 0
     logged_teacher_attn_kl_debug = False
+    logged_attn_rank_debug = False
     if runtime_args.local_rank == 0 and teacher is not None and teacher_feature_output_layers and runtime_args.teacher_feature_output_weight > 0:
         print(
             "Teacher feature-output hooks: "
@@ -6603,6 +6676,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 anchor_ref_attn_kl_loss = loss.new_zeros(())
                 teacher_attn_kl_loss = loss.new_zeros(())
                 teacher_qk_rel_loss = loss.new_zeros(())
+                attn_rank_loss = loss.new_zeros(())
+                attn_rank_pairs = 0
                 teacher_attn_output_loss = loss.new_zeros(())
                 teacher_feature_output_loss = loss.new_zeros(())
                 act_scale_anchor_loss_value = loss.new_zeros(())
@@ -6737,6 +6812,23 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                         components=runtime_args.teacher_qkv_rel_components,
                     )
                     loss = loss + runtime_args.teacher_qkv_rel_weight * teacher_qk_rel_loss
+                if runtime_args.attn_rank_weight > 0 and teacher_attn_info is not None:
+                    attn_rank_loss, attn_rank_pairs = attention_relation_ranking_loss(
+                        student_attn_info,
+                        teacher_attn_info,
+                        head_mode=runtime_args.ref_head_mode,
+                        topk=runtime_args.attn_rank_topk,
+                    )
+                    loss = loss + runtime_args.attn_rank_weight * attn_rank_loss
+                    if runtime_args.local_rank == 0 and not logged_attn_rank_debug:
+                        print(
+                            "Attention-relation ranking debug: "
+                            f"weight={runtime_args.attn_rank_weight}, topk={runtime_args.attn_rank_topk}, "
+                            f"head_mode={runtime_args.ref_head_mode}, valid_pairs={attn_rank_pairs}, "
+                            f"student_layers={len(extract_attn_prob_list(student_attn_info))}, "
+                            f"teacher_layers={len(extract_attn_prob_list(teacher_attn_info))}"
+                        )
+                        logged_attn_rank_debug = True
                 if capture_teacher_attn_output:
                     teacher_attn_output_loss = attention_output_mse_loss(student_attn_outputs, teacher_attn_outputs)
                     loss = loss + runtime_args.teacher_attn_output_weight * teacher_attn_output_loss
@@ -6928,6 +7020,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
             anchor_ref_attn_kl_loss_for_log = anchor_ref_attn_kl_loss.detach()
             teacher_attn_kl_loss_for_log = teacher_attn_kl_loss.detach()
             teacher_qk_rel_loss_for_log = teacher_qk_rel_loss.detach()
+            attn_rank_loss_for_log = attn_rank_loss.detach()
             teacher_attn_output_loss_for_log = teacher_attn_output_loss.detach()
             teacher_feature_output_loss_for_log = teacher_feature_output_loss.detach()
             act_scale_anchor_loss_for_log = act_scale_anchor_loss_value.detach()
@@ -6944,6 +7037,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 anchor_ref_attn_kl_losses_m.update(anchor_ref_attn_kl_loss_for_log.item(), input.size(0))
                 teacher_attn_kl_losses_m.update(teacher_attn_kl_loss_for_log.item(), input.size(0))
                 teacher_qk_rel_losses_m.update(teacher_qk_rel_loss_for_log.item(), input.size(0))
+                attn_rank_losses_m.update(attn_rank_loss_for_log.item(), input.size(0))
                 teacher_attn_output_losses_m.update(teacher_attn_output_loss_for_log.item(), input.size(0))
                 teacher_feature_output_losses_m.update(teacher_feature_output_loss_for_log.item(), input.size(0))
                 act_scale_anchor_losses_m.update(act_scale_anchor_loss_for_log.item(), input.size(0))
@@ -7076,6 +7170,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 reduced_anchor_ref_attn_kl_loss = reduce_tensor(anchor_ref_attn_kl_loss_for_log, runtime_args.world_size)
                 reduced_teacher_attn_kl_loss = reduce_tensor(teacher_attn_kl_loss_for_log, runtime_args.world_size)
                 reduced_teacher_qk_rel_loss = reduce_tensor(teacher_qk_rel_loss_for_log, runtime_args.world_size)
+                reduced_attn_rank_loss = reduce_tensor(attn_rank_loss_for_log, runtime_args.world_size)
                 reduced_teacher_attn_output_loss = reduce_tensor(teacher_attn_output_loss_for_log, runtime_args.world_size)
                 reduced_teacher_feature_output_loss = reduce_tensor(teacher_feature_output_loss_for_log, runtime_args.world_size)
                 reduced_act_scale_anchor_loss = reduce_tensor(act_scale_anchor_loss_for_log, runtime_args.world_size)
@@ -7091,6 +7186,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 anchor_ref_attn_kl_losses_m.update(reduced_anchor_ref_attn_kl_loss.item(), input.size(0))
                 teacher_attn_kl_losses_m.update(reduced_teacher_attn_kl_loss.item(), input.size(0))
                 teacher_qk_rel_losses_m.update(reduced_teacher_qk_rel_loss.item(), input.size(0))
+                attn_rank_losses_m.update(reduced_attn_rank_loss.item(), input.size(0))
                 teacher_attn_output_losses_m.update(reduced_teacher_attn_output_loss.item(), input.size(0))
                 teacher_feature_output_losses_m.update(reduced_teacher_feature_output_loss.item(), input.size(0))
                 act_scale_anchor_losses_m.update(reduced_act_scale_anchor_loss.item(), input.size(0))
@@ -7109,6 +7205,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                     f"AnchorRefAttnKL: {anchor_ref_attn_kl_losses_m.val:.3e} ({anchor_ref_attn_kl_losses_m.avg:.3e})  "
                     f"TeacherAttnKL: {teacher_attn_kl_losses_m.val:.3e} ({teacher_attn_kl_losses_m.avg:.3e})  "
                     f"TeacherRel: {teacher_qk_rel_losses_m.val:.3e} ({teacher_qk_rel_losses_m.avg:.3e})  "
+                    f"AttnRank: {attn_rank_losses_m.val:.3e} ({attn_rank_losses_m.avg:.3e})  "
                     f"TeacherAttnOut: {teacher_attn_output_losses_m.val:.3e} ({teacher_attn_output_losses_m.avg:.3e})  "
                     f"TeacherFeatOut: {teacher_feature_output_losses_m.val:.3e} ({teacher_feature_output_losses_m.avg:.3e})  "
                     f"ActScaleAnchor: {act_scale_anchor_losses_m.val:.3e} ({act_scale_anchor_losses_m.avg:.3e})  "
@@ -7168,8 +7265,14 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
         enabled_modules = enable_attention_collection(model)
         if runtime_args.local_rank == 0:
             print(f"Enabled attention collection for {enabled_modules} modules.")
-    if runtime_args.train_scheme == "ema_ref_attn_kl":
+    if runtime_args.train_scheme == "ema_ref_attn_kl" or runtime_args.attn_rank_weight > 0:
         set_attention_mode(model, collect_attention=True, qqkkvv=qqkkvv)
+        if runtime_args.attn_rank_weight > 0 and runtime_args.local_rank == 0:
+            print(
+                "Enabled attention-relation ranking: "
+                f"weight={runtime_args.attn_rank_weight}, topk={runtime_args.attn_rank_topk}, "
+                f"head_mode={runtime_args.ref_head_mode}"
+            )
     load_initial_after_alpha = bool(runtime_args.initial_checkpoint and not runtime_args.eval_only)
 
     teacher = None
@@ -8306,6 +8409,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-attn-kl-weight", dest="teacher_attn_kl_weight", type=float, default=None, help="FP teacher attention KL 权重")
     parser.add_argument("--teacher-attn-kl-warmup-epochs", dest="teacher_attn_kl_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 FP teacher attention KL")
     parser.add_argument("--teacher-attn-kl-weight-epoch-overrides", dest="teacher_attn_kl_weight_epoch_overrides", type=str, default=None, help="按 epoch 覆盖 FP teacher attention KL 权重，格式 epoch:value,epoch:value")
+    parser.add_argument("--attn-rank-weight", dest="attn_rank_weight", type=float, default=None, help="教师注意力大小关系（top-k key 成对排序）损失权重；>0 时自动开启注意力采集")
+    parser.add_argument("--attn-rank-topk", dest="attn_rank_topk", type=int, default=None, help="每行取教师 top-k 个 key 作为排序起点，默认 1")
     parser.add_argument("--teacher-attn-output-weight", dest="teacher_attn_output_weight", type=float, default=None, help="FP teacher attention module output MSE 权重")
     parser.add_argument("--teacher-attn-output-layers", dest="teacher_attn_output_layers", type=str, default=None, help="teacher attention output MSE 层选择: all 或逗号分隔 attention layer index")
     parser.add_argument("--teacher-attn-output-warmup-epochs", dest="teacher_attn_output_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 FP teacher attention output MSE")

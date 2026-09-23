@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .qlinear import LSQ_input
-from src.deit_vision_transformer import Attention as deit_attention
+from src.deit_vision_transformer import Attention as deit_attention, select_attention_heads
 from ..modules.qbias import LearnableBias
 from .qlinear import QLinear, LSQ_w_and_act_QLinear
 from ..quantizer.lsq import LsqQuantizer, LsqQuantizer4v
@@ -97,12 +97,13 @@ class QAttention(deit_attention):
         attn_prob = F.softmax(attn_weights, dim=-1)
 
         attn_prob = self.quan_a_softmax_fn(attn_prob)
+        collected_attn = select_attention_heads(attn_prob, self) if self.collect_attention else None
         attn_prob = self.attn_drop(attn_prob)
 
         x = (attn_prob @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x, None
+        return x, collected_attn
 
 class QAttention_qkreparam(deit_attention):
     def __init__(self, m: deit_attention, weight_bits=8, input_bits=8, aq_learnable=True, wq_learnable = True,
@@ -214,12 +215,13 @@ class QAttention_qkreparam(deit_attention):
         attn_prob = F.softmax(attn_weights, dim=-1)
 
         attn_prob = self.quan_a_softmax_fn(attn_prob)
+        collected_attn = select_attention_heads(attn_prob, self) if self.collect_attention else None
         attn_prob = self.attn_drop(attn_prob)
 
         x = (attn_prob @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x, None
+        return x, collected_attn
 
 class QAttention_qkreparam_4_cga(deit_attention):
     def __init__(self, m: deit_attention, clip_val=2.5, weight_bits=8, input_bits=8, aq_learnable=True, wq_learnable = True,
@@ -331,12 +333,13 @@ class QAttention_qkreparam_4_cga(deit_attention):
         attn_prob = F.softmax(attn_weights, dim=-1)
 
         attn_prob = self.quan_a_softmax_fn(attn_prob)
+        collected_attn = select_attention_heads(attn_prob, self) if self.collect_attention else None
         attn_prob = self.attn_drop(attn_prob)
 
         x = (attn_prob @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x, None
+        return x, collected_attn
 
 class QAttention_lsq(deit_attention):
     def __init__(self, m: deit_attention, clip_val=2.5, weight_bits=8, input_bits=8, aq_learnable=True, wq_learnable = True,
@@ -429,11 +432,11 @@ class QAttention_lsq(deit_attention):
         attn_prob = F.softmax(attn_weights, dim=-1)
 
         attn_prob = self.quan_a_softmax_fn(attn_prob)
+        collected_attn = select_attention_heads(attn_prob, self) if self.collect_attention else None
         attn_prob = self.attn_drop(attn_prob)
 
         x = (attn_prob @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
-        return x, None
-
+        return x, collected_attn

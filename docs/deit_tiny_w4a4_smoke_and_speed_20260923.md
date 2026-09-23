@@ -83,17 +83,42 @@
 - 离线 attention 震荡分析脚本（`third_party/OFQ/tools/offline_attention_oscillation.py` 与
   `tmp_scripts/analyze_attn_relation_oscillation_*.py`）是 Swin 专用（`SWIN_STAGE_SPECS`），DeiT 要用需另写 probe。
 
-## 6. 上 attention 约束之前还差的两处代码
+## 6. DeiT 注意力采集 + attention-relation ranking（本次实现）
 
-1. `third_party/OFQ/src/quantization/modules/attention.py` 里四个 DeiT 量化注意力（含 standard 的
-   `QAttention_qkreparam`）forward 都是 `return x, None`，**不返回注意力矩阵**，因此 DeiT 上任何 attention-KL /
-   attention-ranking 目前都会静默为 0。需要照 `QAttention_swin` 的写法，在 `qqkkvv` / `collect_attention` 时返回
-   softmax 后的注意力（并按需支持 head 子集）。
-2. DeiT 的 FP `Attention`（`src/deit_vision_transformer.py`）只有 `qqkkvv` 开关，没有 `collect_attention` /
-   `collect_attention_head_indices`；上游 `set_selected_attention_heads()` 对 DeiT 无效（只在 loss 层切片生效）。
+两处改动，都很小：
 
-另外注意 DeiT 的注意力形状是 `[B, 3, 198, 198]`（每行 198 个 key），比 Swin 窗口内的 49 大 4 倍，
-做 attention-ranking 时成对张量规模要按这个量级估算。
+1. **DeiT 注意力可被采集**：`src/deit_vision_transformer.py` 的 `Attention` 增加 `collect_attention` 开关与
+   `select_attention_heads()`（支持 `collect_attention_head_indices` 的 head 子集），`Block.forward` 在开关打开时把
+   注意力一起返回；`src/quantization/modules/attention.py` 的四个量化注意力（含 `QAttention_qkreparam`）在
+   `collect_attention` 打开时返回量化后的 softmax 注意力，不再恒为 `None`。
+   `qat_launch.py` 里 `is_attention_module()` / `set_selected_attention_heads()` / `enable_attention_collection()`
+   原先只认 Swin，现在也认 DeiT。
+2. **新增 attention-relation ranking 损失**（`attention_relation_ranking_loss()`）：教师在每个 (head, query) 行内取
+   top-k 个 key，与所有教师分数严格更低的 key 组成有向对，用 `softplus(-(log s_c - log s_d))` 要求学生保持同样顺序；
+   log 概率差等于 softmax 前的分数差，所以等价于约束 QK 分数的大小关系。教师只提供顺序，不提供数值。
+
+用法（默认关闭，`--attn-rank-weight` 为 0 时完全不生效）：
+
+```bash
+--attn-rank-weight 1.0              # >0 才会自动打开 student/teacher 的注意力采集
+--attn-rank-topk 1                  # 每行排序起点个数，默认 1
+--ref-head-mode custom_subset:0:0,1:0,2:0,3:0,4:0   # 复用已有开关限制层/head
+```
+
+训练日志会打印一次 `Attention-relation ranking debug: ... valid_pairs=...`（用来确认真的拿到注意力、不是静默 0），
+每个 log 区间里多一列 `AttnRank: x (avg)`。
+
+### 6.1 速度影响（DeiT-Tiny bs32，400 updates，同一张卡）
+
+| 配置 | 稳态 median s/step | 稳态 img/s | 整段 avg_step_time |
+|---|---:|---:|---:|
+| 不开 ranking（本次改动前） | 0.144 | 222 | 0.189 |
+| 不开 ranking（本次改动后） | 0.137 | 234 | 0.195 |
+| ranking，全部 36 个 head | 0.179 | 178 | 0.202 |
+| ranking，5 个 head（`custom_subset`） | 0.150 | 213 | 0.191 |
+
+结论：默认关闭时开销可忽略；全 head 打开约 +30% 单步（仍是 Swin-T bs32 的 1.85×），限定 head 后约 +9%。
+DeiT 注意力形状是 `[B, 3, 198, 198]`（每行 198 个 key），比 Swin 窗口内的 49 大 4 倍，所以 head/layer 要按需限制。
 
 ## 7. 复现
 
@@ -106,6 +131,10 @@ GPU=4 STEPS=400 BATCH=32 LOGINTERVAL=25 TAG=speed RUNS=deit,swin \
 # 只看 DeiT, 换 batch
 GPU=4 STEPS=400 BATCH=128 LOGINTERVAL=25 TAG=bs128 RUNS=deit \
   bash tmp_scripts/smoke_deit_vs_swin_speed_20260923.sh
+
+# 带 attention-relation ranking 的短跑（EXTRA 里的参数原样追加给 qat_launch.py）
+GPU=4 STEPS=400 BATCH=32 LOGINTERVAL=25 TAG=rank RUNS=deit \
+  EXTRA="--attn-rank-weight 1.0" bash tmp_scripts/smoke_deit_vs_swin_speed_20260923.sh
 ```
 
 日志落在 `/tmp/qat_smoke_20260923/`，输出（checkpoint）落在 `/tmp/qat_runs_smoke_20260923/`，两者都在 `/tmp`，会随清理消失。

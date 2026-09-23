@@ -82,6 +82,16 @@ class Mlp(nn.Module):
         x = self.drop2(x)
         return x
 
+def select_attention_heads(attn, module):
+    """按 collect_attention_head_indices 选取要返回的 head；未设置时返回全部。"""
+    head_indices = getattr(module, "collect_attention_head_indices", None)
+    if head_indices is None:
+        return attn
+    if len(head_indices) == 0:
+        return None
+    return attn[:, head_indices]
+
+
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., qqkkvv = False):
         super().__init__()
@@ -96,6 +106,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.qqkkvv = qqkkvv
+        self.collect_attention = False
 
     def forward(self, x):
         B, N, C = x.shape
@@ -127,6 +138,8 @@ class Attention(nn.Module):
             x = (attn @ v).transpose(1, 2).reshape(B, N, C)
             x = self.proj(x)
             x = self.proj_drop(x)
+            if self.collect_attention:
+                return x, select_attention_heads(attn_matrix, self)
             return x, None
 
 class Block(nn.Module):
@@ -151,8 +164,9 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.qqkkvv = qqkkvv
 
-    def forward(self, x):            
-        if self.qqkkvv:
+    def forward(self, x):
+        collect_attention = self.qqkkvv or getattr(self.attn, "collect_attention", False)
+        if collect_attention:
             temp_x, attn_mtrx = self.attn(self.norm1(x))
             x = x + self.drop_path(temp_x)
             x = x + self.drop_path(self.mlp(self.norm2(x)))
@@ -485,8 +499,6 @@ def checkpoint_filter_fn(state_dict, model):
                 v, model.pos_embed, getattr(model, 'num_tokens', 1), model.patch_embed.grid_size)
         out_dict[k] = v
     return out_dict
-
-
 
 
 
