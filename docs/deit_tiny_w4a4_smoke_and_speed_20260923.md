@@ -189,6 +189,21 @@ DeiT-Tiny 0.137 s/step = 234 img/s、Swin-T 0.331 s/step = 97 img/s；多卡按�
 同一张卡上同配置的相对波动可以很大：今天从空闲时的 0.137 s/step（DeiT bs32）漂到别人把 2/5/6/7 号卡占满时的
 0.228 s/step（+66%）。所以下面这张表按"能拿到空闲卡"来读，抢不到卡时按 1.5~2× 折算。
 
+### 8.1 四卡 Swin-T W4A4 + logits ranking 实测（2026-09-24）
+
+4 卡（GPU 4,5,6,7）、bs32/卡、KD + `--logit-rank-weight 1.0`、400 步：
+
+| 指标 | 实测 |
+|---|---|
+| 每 rank micro-step（稳态中位） | 0.362 s（15 个区间的中位数） |
+| 聚合吞吐 | 128 / 0.362 = **354 img/s**（单卡 97 img/s 的 3.65×，DDP 近线性） |
+| 每 epoch（10,009 micro-step，global batch 128） | **约 1.0 h**（含启动/小停顿按 0.373 s/step 算是 1.04 h） |
+| 100 epoch 训练 | **约 4.2~4.3 天** |
+| 加上每 epoch 50k 全量验证 | 再 +约 1.7 h（100 epoch 合计） |
+
+对应启动脚本：`tmp_scripts/run_swin_w4a4_100ep_logitrank_4gpu_20260924.sh`
+（bs32/卡 × 4 卡 × accum 4 = 512 图/优化步，与历史 8×H100 对照一致；`RANK_W` 控制 ranking 权重）。
+
 DeiT 还能吃更大 batch 换吞吐（单卡 bs64 实测 339 img/s、bs128 稳定段 401 img/s，Swin bs64 在 24GB 上 OOM），
 所以 8 卡 bs64 时 DeiT 的 100 epoch 算力口径可以压到 ~14 h。
 
