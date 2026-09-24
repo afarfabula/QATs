@@ -204,6 +204,35 @@ DeiT-Tiny 0.137 s/step = 234 img/s、Swin-T 0.331 s/step = 97 img/s；多卡按�
 对应启动脚本：`tmp_scripts/run_swin_w4a4_100ep_logitrank_4gpu_20260924.sh`
 （bs32/卡 × 4 卡 × accum 4 = 512 图/优化步，与历史 8×H100 对照一致；`RANK_W` 控制 ranking 权重）。
 
+### 8.2 logits ranking 权重定标（2026-09-24）
+
+方法沿用 `rank_idea` 文档的 ρ 思路，但共享张量换成学生 logits（两个损失都作用在它上面）：
+
+1. **梯度范数探针**（`--extra-arg=--logit-rank-probe`，只跑一次，用真实配方 bs32 + 预训练学生/教师 + KD T=2.75）：
+
+   ```text
+   LogitRank grad probe: ||dKD/ds||=1.5586e-02  ||dRank/ds||=3.9782e-02  ratio=0.392
+   lambda(rho=0.03)=0.0118   lambda(rho=0.1)=0.0392   lambda(rho=0.3)=0.1175
+   ```
+
+   ρ=0.1（文档取值）⇒ **λ ≈ 0.04**。注意 KD 在初始化时梯度很小（量化学生与 FP 教师非常接近），
+   所以按"损失数值比"直觉给权（比如 1.0）会过强。
+
+2. **λ 扫描校验**（4 卡并行，每档 700 micro-step = 44 个优化步、有效 batch 512、同种子同数据顺序）：
+
+   | λ | BaseLoss（≥700 步均值） | LogitRank（≥700 步均值） |
+   |---:|---:|---:|
+   | 0（对照） | 52.2579 | — |
+   | **0.04** | 52.2566 | 0.6328 |
+   | 0.12 | 52.2536 | 0.6188 |
+   | 0.4 | 52.2446 | 0.5712 |
+
+   结论：KD 轨迹在各 λ 下几乎完全重合（λ=0.4 也只看第 3 位小数），说明该约束不扰动主目标；
+   ranking loss 在 λ=0.04 就已明显下降，再放大 10 倍只有边际收益，因此取 **λ=0.04**。
+   扫描脚本：`tmp_scripts/sweep_swin_w4a4_logitrank_weight_4gpu_20260924.sh`。
+
+   注意 `--max_train_updates` 现在按**优化步**计数（不是 micro-step），扫描里传 1500 实际会跑 1500 个优化步。
+
 DeiT 还能吃更大 batch 换吞吐（单卡 bs64 实测 339 img/s、bs128 稳定段 401 img/s，Swin bs64 在 24GB 上 OOM），
 所以 8 卡 bs64 时 DeiT 的 100 epoch 算力口径可以压到 ~14 h。
 

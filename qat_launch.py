@@ -847,10 +847,12 @@ def load_ofq_training_module():
     from src.quantization.modules.utils import replace_module_by_qmodule_deit, replace_module_by_qmodule_swin
     from src.attn_relation_ranking import attention_relation_ranking_loss
     from src.logits_ranking import logits_ranking_loss
+    from src.logits_ranking import primary_logits
 
     _OFQ_TRAIN_MODULE = SimpleNamespace(
         attention_relation_ranking_loss=attention_relation_ranking_loss,
         logits_ranking_loss=logits_ranking_loss,
+        primary_logits=primary_logits,
         KDLossSoftandHard=KDLossSoftandHard,
         KDLossSoftandHard_qk=KDLossSoftandHard_qk,
         KDLossSoftandHard_qkv=KDLossSoftandHard_qkv,
@@ -947,6 +949,7 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--attn-rank-topk", dest="attn_rank_topk", type=int)
     parser.add_argument("--logit-rank-weight", dest="logit_rank_weight", type=float)
     parser.add_argument("--logit-rank-topk", dest="logit_rank_topk", type=int)
+    parser.add_argument("--logit-rank-probe", dest="logit_rank_probe", action="store_true", help="只跑一次：打印 KD 与 logits-ranking 在学生 logits 上的梯度范数比，用来定权重")
     parser.add_argument("--ref-head-mode-epoch-overrides", dest="ref_head_mode_epoch_overrides", type=str)
     parser.add_argument("--teacher-attn-output-weight", dest="teacher_attn_output_weight", type=float)
     parser.add_argument("--teacher-attn-output-layers", dest="teacher_attn_output_layers", type=str)
@@ -1403,6 +1406,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "attn_rank_topk": 1,
         "logit_rank_weight": 0.0,
         "logit_rank_topk": 5,
+        "logit_rank_probe": False,
         "teacher_attn_output_weight": 0.0,
         "teacher_attn_output_layers": "all",
         "teacher_attn_output_warmup_epochs": 0,
@@ -6301,6 +6305,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     logged_teacher_attn_kl_debug = False
     logged_attn_rank_debug = False
     logged_logit_rank_debug = False
+    logged_logit_rank_probe = False
     attn_rank_loss_fn = (
         load_ofq_training_module().attention_relation_ranking_loss
         if runtime_args.attn_rank_weight > 0
@@ -6801,6 +6806,27 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                         teacher_logit,
                         topk=runtime_args.logit_rank_topk,
                     )
+                    if runtime_args.logit_rank_probe and not logged_logit_rank_probe:
+                        # 一次性的权重标定探针：在共享张量（学生 logits）上比较两个损失的梯度范数，
+                        # 和 rank_idea 文档里 rho=0.1 的做法同源。只在单进程短跑里用。
+                        try:
+                            probe_logits = load_ofq_training_module().primary_logits(student_logit)
+                            g_kd, = torch.autograd.grad(loss, probe_logits, retain_graph=True, allow_unused=True)
+                            g_rank, = torch.autograd.grad(logit_rank_loss, probe_logits, retain_graph=True, allow_unused=True)
+                            n_kd = float(g_kd.float().norm()) if g_kd is not None else 0.0
+                            n_rank = float(g_rank.float().norm()) if g_rank is not None else 0.0
+                            print(
+                                "LogitRank grad probe: "
+                                f"||dKD/ds||={n_kd:.4e} ||dRank/ds||={n_rank:.4e} "
+                                f"ratio={n_kd / max(n_rank, 1e-12):.3f} | "
+                                f"lambda(rho=0.03)={0.03 * n_kd / max(n_rank, 1e-12):.4g} "
+                                f"lambda(rho=0.1)={0.1 * n_kd / max(n_rank, 1e-12):.4g} "
+                                f"lambda(rho=0.3)={0.3 * n_kd / max(n_rank, 1e-12):.4g} "
+                                f"| local_rank={runtime_args.local_rank}"
+                            )
+                        except RuntimeError as exc:
+                            print(f"LogitRank grad probe failed: {exc}")
+                        logged_logit_rank_probe = True
                     loss = loss + runtime_args.logit_rank_weight * logit_rank_loss
                     if runtime_args.local_rank == 0 and not logged_logit_rank_debug:
                         print(

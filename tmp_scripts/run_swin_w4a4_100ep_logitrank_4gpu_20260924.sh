@@ -20,7 +20,7 @@ TEACHER="${TEACHER:-/home_ext/quyanyi/qat_weights/swin_t-704ceda3.pth}"
 PY="${PY:-/datadisk2/quyanyi/envs/qat_env/bin/python}"
 DEVICES="${DEVICES:-4,5,6,7}"
 MASTER_PORT="${MASTER_PORT:-30690}"
-RANK_W="${RANK_W:-1e-2}"        # 分类 logits ranking 权重；先看短跑再定
+RANK_W="${RANK_W:-0.04}"        # 分类 logits ranking 权重；由梯度范数探针定标（rho=0.1）+ λ 扫描校验
 RANK_TOPK="${RANK_TOPK:-5}"
 SECONDS=0
 
