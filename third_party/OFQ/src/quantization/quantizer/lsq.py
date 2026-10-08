@@ -657,6 +657,24 @@ class LsqQuantizer(torch.nn.Module):
         x = x * s_scale
         return x
 
+    def forward_detached_scale(self, x):
+        """数值和 forward(x) 完全相同,但切断输出到量化步长 `s` 的梯度路径。
+
+        用途:让某些损失(例如 attention-relation ranking)只能作用于被量化的数值本身,
+        而不能通过缩小量化步长 `s` 把小于 s/2 的注意力尾部 round 成精确的 0 来"作弊"
+        (0 会被损失里的 clamp_min(eps) 变成白送的零损失)。
+        梯度对输入 x 仍然正常回传。
+        """
+        scale_param = self._parameters.get("s")
+        if scale_param is None:
+            return self.forward(x)
+        # 放进 __dict__ 可以绕过 nn.Module.__getattr__,让 forward 里的 self.s 读到 detached 张量
+        self.__dict__["s"] = scale_param.detach()
+        try:
+            return self.forward(x)
+        finally:
+            self.__dict__.pop("s", None)
+
     def extra_repr(self):
         return (
             f"bit={self.bit}, "

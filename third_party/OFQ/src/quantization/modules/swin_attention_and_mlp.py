@@ -62,6 +62,31 @@ class QMLP_swin(torch.nn.Module):
         x = self.drop2(x)
         return x
 
+def collected_attention_view(module, attn_post, attn_pre, head_indices):
+    """返回交给 rank / KL 收集器的注意力张量。
+
+    module.collect_attn_target:
+      post_quant                -- 网络实际使用的那份(默认,保持原行为)
+      post_quant_detached_scale -- 数值相同,但切断到 LSQ 量化步长 `s` 的梯度路径。
+                                   排序损失不允许通过缩小 s 把注意力尾部打成 0 来作弊。
+      pre_quant                 -- softmax 之后、激活量化之前的概率。
+    """
+    target = getattr(module, "collect_attn_target", "post_quant")
+    if target == "pre_quant":
+        out = attn_pre
+    elif target == "post_quant_detached_scale":
+        quantizer = getattr(module, "quan_a_softmax_fn", None)
+        out = quantizer.forward_detached_scale(attn_pre)
+        dropout = getattr(module, "attention_dropout", 0.0)
+        if dropout:
+            out = F.dropout(out, p=dropout)
+    else:
+        out = attn_post
+    if head_indices is not None:
+        out = out[:, head_indices]
+    return out
+
+
 class QAttention_swin(ShiftedWindowAttention):
     def __init__(self, m: ShiftedWindowAttention, weight_bits=8, input_bits=8, aq_learnable=True, wq_learnable = True,
                  weight_channelwise=True, input_channelwise=True, weight_quant_method="statsq", input_quant_method="lsq",
@@ -222,6 +247,7 @@ class QAttention_swin(ShiftedWindowAttention):
             attn = attn.view(-1, self.num_heads, x.size(1), x.size(1))
 
         attn = F.softmax(attn, dim=-1)
+        attn_prob = attn  # 量化前的注意力概率,供 collect_attn_target 使用
         attn = self.quan_a_softmax_fn(attn)
         attn = F.dropout(attn, p=self.attention_dropout)
 
@@ -250,11 +276,9 @@ class QAttention_swin(ShiftedWindowAttention):
             return x, (attn, q_score, k_score, v_score)
         elif getattr(self, 'collect_attention', False):
             head_indices = getattr(self, 'collect_attention_head_indices', None)
-            if head_indices is not None:
-                if len(head_indices) == 0:
-                    return x, None
-                attn = attn[:, head_indices]
-            return x, attn
+            if head_indices is not None and len(head_indices) == 0:
+                return x, None
+            return x, collected_attention_view(self, attn, attn_prob, head_indices)
         else:
             return x, None
         
@@ -453,6 +477,7 @@ class QAttention_swin_qkreparam(ShiftedWindowAttention):
             attn = attn.view(-1, self.num_heads, x.size(1), x.size(1))
 
         attn = F.softmax(attn, dim=-1)
+        attn_prob = attn  # 量化前的注意力概率,供 collect_attn_target 使用
         attn = self.quan_a_softmax_fn(attn)
         attn = F.dropout(attn, p=self.attention_dropout)
 
@@ -485,11 +510,9 @@ class QAttention_swin_qkreparam(ShiftedWindowAttention):
             return x, (attn, q_score, k_score, v_score)
         elif getattr(self, 'collect_attention', False):
             head_indices = getattr(self, 'collect_attention_head_indices', None)
-            if head_indices is not None:
-                if len(head_indices) == 0:
-                    return x, None
-                attn = attn[:, head_indices]
-            return x, attn
+            if head_indices is not None and len(head_indices) == 0:
+                return x, None
+            return x, collected_attention_view(self, attn, attn_prob, head_indices)
         else:
             return x, None
         
@@ -679,6 +702,7 @@ class QAttention_swin_qkreparam_4_cga(ShiftedWindowAttention):
             attn = attn.view(-1, self.num_heads, x.size(1), x.size(1))
 
         attn = F.softmax(attn, dim=-1)
+        attn_prob = attn  # 量化前的注意力概率,供 collect_attn_target 使用
         attn = self.quan_a_softmax_fn(attn)
         attn = F.dropout(attn, p=self.attention_dropout)
 
@@ -707,11 +731,9 @@ class QAttention_swin_qkreparam_4_cga(ShiftedWindowAttention):
             return x, (attn, q_score, k_score, v_score)
         elif getattr(self, 'collect_attention', False):
             head_indices = getattr(self, 'collect_attention_head_indices', None)
-            if head_indices is not None:
-                if len(head_indices) == 0:
-                    return x, None
-                attn = attn[:, head_indices]
-            return x, attn
+            if head_indices is not None and len(head_indices) == 0:
+                return x, None
+            return x, collected_attention_view(self, attn, attn_prob, head_indices)
         else:
             return x, None
         

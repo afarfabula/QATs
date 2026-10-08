@@ -950,6 +950,11 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--attn-rank-source", dest="attn_rank_source", type=str)
     parser.add_argument("--attn-rank-min-attn", dest="attn_rank_min_attn", type=float)
     parser.add_argument("--attn-rank-probe", dest="attn_rank_probe", action="store_true")
+    parser.add_argument("--attn-rank-target", dest="attn_rank_target", type=str)
+    parser.add_argument("--freeze-attn-softmax-scale", dest="freeze_attn_softmax_scale", action="store_true")
+    parser.add_argument("--freeze-param-suffix", dest="freeze_param_suffix", type=str)
+    parser.add_argument("--attn-rank-hinge", dest="attn_rank_hinge", action="store_true")
+    parser.add_argument("--attn-rank-margin", dest="attn_rank_margin", type=float)
     parser.add_argument("--logit-rank-weight", dest="logit_rank_weight", type=float)
     parser.add_argument("--logit-rank-topk", dest="logit_rank_topk", type=int)
     parser.add_argument("--logit-rank-probe", dest="logit_rank_probe", action="store_true", help="只跑一次：打印 KD 与 logits-ranking 在学生 logits 上的梯度范数比，用来定权重")
@@ -1410,6 +1415,11 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "attn_rank_source": "teacher",
         "attn_rank_min_attn": 1e-4,
         "attn_rank_probe": False,
+        "attn_rank_target": "post_quant",
+        "freeze_attn_softmax_scale": False,
+        "freeze_param_suffix": "",
+        "attn_rank_hinge": False,
+        "attn_rank_margin": 0.0,
         "logit_rank_weight": 0.0,
         "logit_rank_topk": 5,
         "logit_rank_probe": False,
@@ -1754,6 +1764,16 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["attn_rank_min_attn"] = args.attn_rank_min_attn
     if getattr(args, "attn_rank_probe", False):
         defaults["attn_rank_probe"] = True
+    if getattr(args, "attn_rank_target", None) is not None:
+        defaults["attn_rank_target"] = args.attn_rank_target
+    if getattr(args, "freeze_attn_softmax_scale", False):
+        defaults["freeze_attn_softmax_scale"] = True
+    if getattr(args, "freeze_param_suffix", None) is not None:
+        defaults["freeze_param_suffix"] = args.freeze_param_suffix
+    if getattr(args, "attn_rank_hinge", False):
+        defaults["attn_rank_hinge"] = True
+    if getattr(args, "attn_rank_margin", None) is not None:
+        defaults["attn_rank_margin"] = args.attn_rank_margin
     if getattr(args, "logit_rank_weight", None) is not None:
         defaults["logit_rank_weight"] = args.logit_rank_weight
     if getattr(args, "logit_rank_topk", None) is not None:
@@ -2160,6 +2180,20 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         raise ValueError(f"attn_rank_source 只能是 teacher 或 ref，收到 {defaults['attn_rank_source']!r}")
     defaults["attn_rank_min_attn"] = float(defaults.get("attn_rank_min_attn", 1e-4) or 1e-4)
     defaults["attn_rank_probe"] = bool(defaults.get("attn_rank_probe", False))
+    defaults["attn_rank_target"] = str(defaults.get("attn_rank_target", "post_quant") or "post_quant").strip().lower()
+    if defaults["attn_rank_target"] not in {"post_quant", "post_quant_detached_scale", "pre_quant"}:
+        raise ValueError(
+            "attn_rank_target 只能是 post_quant / post_quant_detached_scale / pre_quant，"
+            f"收到 {defaults['attn_rank_target']!r}"
+        )
+    defaults["freeze_attn_softmax_scale"] = bool(defaults.get("freeze_attn_softmax_scale", False))
+    sticky_freeze = []
+    if defaults["freeze_attn_softmax_scale"]:
+        sticky_freeze.append("quan_a_softmax_fn.s")
+    sticky_freeze += [item.strip() for item in str(defaults.get("freeze_param_suffix", "") or "").split(",") if item.strip()]
+    defaults["_sticky_freeze_suffixes"] = tuple(dict.fromkeys(sticky_freeze))
+    defaults["attn_rank_hinge"] = bool(defaults.get("attn_rank_hinge", False))
+    defaults["attn_rank_margin"] = float(defaults.get("attn_rank_margin", 0.0) or 0.0)
     defaults["logit_rank_weight"] = float(defaults.get("logit_rank_weight", 0.0) or 0.0)
     defaults["logit_rank_topk"] = int(defaults.get("logit_rank_topk", 5) or 5)
     defaults["teacher_attn_output_weight"] = float(defaults["teacher_attn_output_weight"])
@@ -2599,6 +2633,7 @@ def create_ofq_teacher_model(runtime_args: SimpleNamespace) -> nn.Module:
         or str(getattr(runtime_args, "ref_head_mode", "")).startswith("dynamic_teacher_agree_top")
     ):
         set_attention_mode(teacher, collect_attention=True, qqkkvv=qqkkvv)
+        set_attention_collection_target(teacher, str(getattr(runtime_args, "attn_rank_target", "post_quant") or "post_quant"))
     for param in teacher.parameters():
         param.requires_grad_(False)
     return teacher
@@ -3102,6 +3137,38 @@ def set_selected_attention_heads(model: nn.Module, head_map: Optional[Dict[int, 
         heads = tuple(sorted(set(int(head) for head in head_map.get(layer_idx, ()))))
         setattr(module, "collect_attention_head_indices", heads)
         layer_idx += 1
+
+
+def set_attention_collection_target(model: nn.Module, target: str) -> None:
+    """设置收集器返回哪一份注意力(见 swin_attention_and_mlp.collected_attention_view)。
+
+    post_quant                -- 网络实际使用的那份(默认,保持原行为)
+    post_quant_detached_scale -- 数值相同,但切断到 LSQ 量化步长 s 的梯度路径
+    pre_quant                 -- softmax 之后、激活量化之前的概率
+
+    后两种用于阻止 ranking 损失通过缩小 s 把注意力尾部 round 成 0 来作弊。
+    """
+    for module in model.modules():
+        if is_attention_module(module):
+            setattr(module, "collect_attn_target", target)
+
+
+def freeze_attention_softmax_scales(model: nn.Module) -> int:
+    """冻结所有注意力 softmax 激活量化器的 LSQ 步长 s(不再被任何损失更新)。"""
+    return freeze_parameters_by_suffix(maybe_unwrap_ddp(model), ("quan_a_softmax_fn.s",))
+
+
+def freeze_parameters_by_suffix(model: nn.Module, suffixes: Sequence[str]) -> int:
+    """按参数名子串冻结参数。用于做"禁止某个损失利用某个旋钮"的消融。"""
+    wanted = tuple(str(item).strip() for item in suffixes if str(item).strip())
+    if not wanted:
+        return 0
+    frozen = 0
+    for name, param in model.named_parameters():
+        if any(token in name for token in wanted):
+            param.requires_grad_(False)
+            frozen += 1
+    return frozen
 
 
 def clone_ref_model(student_model: nn.Module) -> nn.Module:
@@ -4858,10 +4925,14 @@ def apply_ref_head_mode_to_models(
     anchor_ref_head_mode = runtime_args.anchor_ref_head_mode or head_mode
     anchor_selected_head_map = ref_head_map(anchor_ref_head_mode)
     set_selected_attention_heads(model, selected_head_map)
+    attn_collect_target = str(getattr(runtime_args, "attn_rank_target", "post_quant") or "post_quant")
+    set_attention_collection_target(model, attn_collect_target)
     if teacher is not None:
         set_selected_attention_heads(teacher, selected_head_map)
+        set_attention_collection_target(teacher, attn_collect_target)
     if ref_model is not None:
         set_selected_attention_heads(ref_model, selected_head_map)
+        set_attention_collection_target(ref_model, attn_collect_target)
     if anchor_ref_model is not None:
         set_selected_attention_heads(anchor_ref_model, anchor_selected_head_map)
     return selected_head_map, anchor_selected_head_map
@@ -6482,6 +6553,11 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
             else:
                 trainable_params, frozen_params = set_trainable_policy(model, "all", runtime_args=runtime_args)
             current_trainable_policy = desired_policy
+            # set_trainable_policy("all") 会把所有参数的 requires_grad 重新置 True,
+            # 所以"粘性冻结"必须在它之后重新施加,否则一次就被覆盖掉。
+            sticky_suffixes = getattr(runtime_args, "_sticky_freeze_suffixes", ())
+            if sticky_suffixes:
+                freeze_parameters_by_suffix(maybe_unwrap_ddp(model), sticky_suffixes)
             if runtime_args.local_rank == 0:
                 print(
                     f"Trainable parameter update policy: epoch={epoch}, update={local_update_count}, "
@@ -6820,6 +6896,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                             heads=parse_ref_head_mode(runtime_args.ref_head_mode),
                             topk=runtime_args.attn_rank_topk,
                             min_attn=runtime_args.attn_rank_min_attn,
+                            hinge=runtime_args.attn_rank_hinge,
+                            margin=runtime_args.attn_rank_margin,
                         )
                         if runtime_args.attn_rank_probe and not logged_attn_rank_probe:
                             # 一次性权重定标探针：两个损失作用在同一个模型参数集上，比较参数梯度范数。
@@ -7345,11 +7423,14 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
             print(f"Enabled attention collection for {enabled_modules} modules.")
     if runtime_args.train_scheme == "ema_ref_attn_kl" or runtime_args.attn_rank_weight > 0:
         set_attention_mode(model, collect_attention=True, qqkkvv=qqkkvv)
+        set_attention_collection_target(model, str(runtime_args.attn_rank_target))
         if runtime_args.attn_rank_weight > 0 and runtime_args.local_rank == 0:
             print(
                 "Enabled attention-relation ranking: "
                 f"weight={runtime_args.attn_rank_weight}, topk={runtime_args.attn_rank_topk}, "
                 f"source={runtime_args.attn_rank_source}, min_attn={runtime_args.attn_rank_min_attn}, "
+                f"collect_target={runtime_args.attn_rank_target}, "
+                f"hinge={runtime_args.attn_rank_hinge}, margin={runtime_args.attn_rank_margin}, "
                 f"head_mode={runtime_args.ref_head_mode}"
             )
     load_initial_after_alpha = bool(runtime_args.initial_checkpoint and not runtime_args.eval_only)
@@ -7601,6 +7682,16 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
         if runtime_args.local_rank == 0:
             print(f"Enabled student weight EMA: decay={runtime_args.model_ema_decay}")
 
+    if getattr(runtime_args, "_sticky_freeze_suffixes", ()):
+        # 必须在 setup_alpha 之后:LSQ 的 s 是在首个 forward 里才创建的。
+        # 注意训练循环里 set_trainable_policy("all") 会把 requires_grad 全部打开,
+        # 所以那里也会重新施加一次(见 _sticky_freeze_suffixes 的使用点)。
+        frozen_tensors = freeze_parameters_by_suffix(maybe_unwrap_ddp(model), runtime_args._sticky_freeze_suffixes)
+        if runtime_args.local_rank == 0:
+            print(
+                "Sticky-froze parameters (no loss may update them): "
+                f"suffixes={list(runtime_args._sticky_freeze_suffixes)}, count={frozen_tensors}"
+            )
     optimizer = create_ofq_optimizer(runtime_args, model)
     updates_per_epoch = max(1, (len(loader_train) + max(1, runtime_args.grad_accum_steps) - 1) // max(1, runtime_args.grad_accum_steps))
     lr_scheduler = WarmupCosineScheduler(
@@ -8496,6 +8587,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-rank-source", dest="attn_rank_source", type=str, default=None, choices=["teacher", "ref"], help="attention-relation ranking 的参考来源：teacher（默认）或 ref（ema/prev-step 参考模型，需要 --train-scheme ema_ref_attn_kl）")
     parser.add_argument("--attn-rank-min-attn", dest="attn_rank_min_attn", type=float, default=None, help="判定 key 为有效 token 的注意力阈值（排除 SW-MSA mask 的 denormal 残值），默认 1e-4")
     parser.add_argument("--attn-rank-probe", dest="attn_rank_probe", action="store_true", help="只跑一次：打印 base loss 与 attn-ranking 在共享 attention 张量上的梯度范数比，用来定权重")
+    parser.add_argument("--attn-rank-target", dest="attn_rank_target", type=str, default=None, choices=["post_quant", "post_quant_detached_scale", "pre_quant"], help="ranking 收集哪一份注意力：post_quant(默认)/post_quant_detached_scale(切断到 softmax 量化步长 s 的梯度)/pre_quant")
+    parser.add_argument("--freeze-attn-softmax-scale", dest="freeze_attn_softmax_scale", action="store_true", help="冻结所有注意力 softmax 激活量化器的 LSQ 步长 s(阻断“缩小 s 把注意力尾部打成 0”的作弊路径)")
+    parser.add_argument("--freeze-param-suffix", dest="freeze_param_suffix", type=str, default=None, help="按参数名子串粘性冻结参数(逗号分隔),例如 move_qkx_b4.bias,move_qkx_aft.bias")
+    parser.add_argument("--attn-rank-hinge", dest="attn_rank_hinge", action="store_true", help="用 relu(margin-Delta) 替代 softplus(-Delta):满足 margin 后梯度为 0,消除“把注意力越推越尖”的压力")
+    parser.add_argument("--attn-rank-margin", dest="attn_rank_margin", type=float, default=None, help="hinge 的目标 margin(默认 0)")
     parser.add_argument("--logit-rank-weight", dest="logit_rank_weight", type=float, default=None, help="教师分类 logits 的 top-k 类别成对排序损失权重")
     parser.add_argument("--logit-rank-topk", dest="logit_rank_topk", type=int, default=None, help="取教师 top-k 个类别作为排序起点，默认 5")
     parser.add_argument("--teacher-attn-output-weight", dest="teacher_attn_output_weight", type=float, default=None, help="FP teacher attention module output MSE 权重")

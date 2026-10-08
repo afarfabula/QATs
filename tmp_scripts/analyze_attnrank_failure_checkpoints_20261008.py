@@ -95,6 +95,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-a", default="/datadisk2/quyanyi/qat_runs/attnrank_ckpt_w0_20261008")
     parser.add_argument("--run-b", default="/datadisk2/quyanyi/qat_runs/attnrank_ckpt_w30_20261008")
+    parser.add_argument("--runs", nargs="*", default=None,
+                        help="只做汇总(不做 A/B 逐张量对比):给一串 run 目录")
     parser.add_argument("--step", default="step_0100.pth.tar")
     parser.add_argument("--data", default="/datadisk2/linyichen/OFQ/ImageNet-1K")
     parser.add_argument("--max-samples", type=int, default=6400)
@@ -102,6 +104,16 @@ def main() -> int:
     cli = parser.parse_args()
 
     device = torch.device(cli.device)
+
+    if cli.runs:
+        print(f"{'run':<46} {'top-1':>8} {'H(b8)':>8} {'H(b10)':>8} {'H(b11)':>8}")
+        for run_dir in cli.runs:
+            ckpt = os.path.join(run_dir, "step_checkpoints", cli.step)
+            r = evaluate(run_dir, ckpt, cli.data, cli.max_samples, device)
+            print(f"{Path(run_dir).name:<46} {r['top1'] * 100:>7.2f}% "
+                  f"{r['entropy'][8]:>8.4f} {r['entropy'][10]:>8.4f} {r['entropy'][11]:>8.4f}")
+        return 0
+
     results = {}
     for label, run_dir in (("A", cli.run_a), ("B", cli.run_b)):
         ckpt = os.path.join(run_dir, "step_checkpoints", cli.step)

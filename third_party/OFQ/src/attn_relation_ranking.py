@@ -28,7 +28,8 @@ def extract_attention_list(attn_info):
     return extracted
 
 
-def attention_relation_ranking_loss(student_attn_info, teacher_attn_info, heads=None, topk: int = 1, eps: float = 1e-8, min_attn: float = 1e-4):
+def attention_relation_ranking_loss(student_attn_info, teacher_attn_info, heads=None, topk: int = 1, eps: float = 1e-8, min_attn: float = 1e-4,
+                                    hinge: bool = False, margin: float = 0.0):
     """教师注意力大小关系的成对排序损失。
 
     教师在每个 (layer, head, query) 行内取 top-k 个 key，与所有教师分数严格更低的 key 组成有向对,
@@ -41,6 +42,13 @@ def attention_relation_ranking_loss(student_attn_info, teacher_attn_info, heads=
     并列（ties）依旧不计入。
 
     heads: None 表示使用所有 (layer, head)；也可以传 ((layer_idx, head_idx), ...) 只约束部分 head。
+
+    损失形状:
+      hinge=False(默认) -- softplus(-Δ)。没有目标 margin,Δ→+∞ 也在降,会持续推大间隔,
+                          在 QAT 里被证明会通过锐化注意力把模型打崩(见 docs 里 2026-10-08 那份分析)。
+      hinge=True        -- relu(margin - Δ)。Δ ≥ margin 时损失和梯度同时为 0,没有"越来越尖"的压力。
+                          margin=0 时就是纯粹的"别把顺序弄反":参考与学生在同一状态时损失恰为 0。
+
     返回 (loss, 有效对数)；没有任何有效对时返回 loss=0。
     """
     student_list = extract_attention_list(student_attn_info)
@@ -87,7 +95,8 @@ def attention_relation_ranking_loss(student_attn_info, teacher_attn_info, heads=
             torch.log(student_head.gather(-1, top_indices).clamp_min(eps)).unsqueeze(-1)
             - torch.log(student_head.clamp_min(eps)).unsqueeze(-2)
         )                                                              # [B, Q, k, K]
-        per_row = (F.softplus(-delta) * valid).sum(dim=(-1, -2)) / pair_count.clamp_min(1)
+        pair_term = torch.relu(float(margin) - delta) if hinge else F.softplus(-delta)
+        per_row = (pair_term * valid).sum(dim=(-1, -2)) / pair_count.clamp_min(1)
         head_loss = per_row[rows].mean()
         total = head_loss if total is None else total + head_loss
         used_heads += 1

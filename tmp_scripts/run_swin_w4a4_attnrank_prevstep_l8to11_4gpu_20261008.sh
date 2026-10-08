@@ -32,6 +32,13 @@ REF_INTERVAL="${REF_INTERVAL:-50}"   # prev-step ref 每多少个 optimizer step
 MAX_UPDATES="${MAX_UPDATES:-0}"      # >0 时提前停止（按 optimizer step 计数，2503/epoch）
 PROBE="${PROBE:-0}"                  # 1 = 只跑一次梯度范数探针，用来定权重
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
+RANK_TARGET="${RANK_TARGET:-post_quant}"   # post_quant / post_quant_detached_scale / pre_quant
+FREEZE_S="${FREEZE_S:-0}"                  # 1 = 冻结注意力 softmax 的 LSQ 步长 s
+FREEZE_SUFFIX="${FREEZE_SUFFIX:-}"         # 逗号分隔的参数名子串,粘性冻结
+HINGE="${HINGE:-0}"                        # 1 = 用 relu(margin-Delta) 替代 softplus(-Delta)
+MARGIN="${MARGIN:-0}"                      # hinge 的目标 margin
+SAVE_STEPS="${SAVE_STEPS:-0}"              # 1 = 按 optimizer step 存 checkpoint（离线评估用）
+STEP_INTERVAL="${STEP_INTERVAL:-50}"
 
 # all heads of global blocks 8,9,10,11 (Swin-T: stage2 = 12 heads, stage3 = 24 heads)
 build_heads() {
@@ -54,6 +61,18 @@ fi
 if [[ "${PROBE}" == "1" ]]; then
   EXTRA+=(--attn-rank-probe)
 fi
+if [[ "${FREEZE_S}" == "1" ]]; then
+  EXTRA+=(--freeze-attn-softmax-scale)
+fi
+if [[ -n "${FREEZE_SUFFIX}" ]]; then
+  EXTRA+=(--freeze-param-suffix "${FREEZE_SUFFIX}")
+fi
+if [[ "${HINGE}" == "1" ]]; then
+  EXTRA+=(--attn-rank-hinge --attn-rank-margin "${MARGIN}")
+fi
+if [[ "${SAVE_STEPS}" == "1" ]]; then
+  EXTRA+=(--extra-arg=--save_step_checkpoints --extra-arg=--step_checkpoint_interval --extra-arg="${STEP_INTERVAL}")
+fi
 
 {
   echo "===== Swin-T W4A4 + attn-relation ranking (ref=prev-step), $(date '+%F %T') ====="
@@ -65,6 +84,8 @@ fi
   echo "DEVICES=${DEVICES}  nproc=${NPROC}  batch=32/GPU  accum=ceil(16/${NPROC})=?  -> 512 images/optimizer step"
   echo "layers=8,9,10,11 (all heads)  n_head_slots=$(echo -n "${HEADS}" | tr ',' '\n' | wc -l)"
   echo "attn_rank_weight=${RANK_W}  topk=${RANK_TOPK}  min_attn=${RANK_MIN_ATTN}  source=ref"
+  echo "attn_rank_target=${RANK_TARGET}  freeze_attn_softmax_scale=${FREEZE_S}  freeze_suffix=${FREEZE_SUFFIX}"
+  echo "hinge=${HINGE}  margin=${MARGIN}"
   echo "ref_update=prev_step  ref_update_interval=${REF_INTERVAL}"
   echo "max_train_updates=${MAX_UPDATES}  probe=${PROBE}"
   nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader || true
@@ -98,6 +119,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONUNBUFFERED=1 \
   --ref-head-mode "${HEADS}" \
   --attn-rank-weight "${RANK_W}" --attn-rank-source ref \
   --attn-rank-topk "${RANK_TOPK}" --attn-rank-min-attn "${RANK_MIN_ATTN}" \
+  --attn-rank-target "${RANK_TARGET}" \
   --extra-arg=--smoothing --extra-arg=0.1 \
   --extra-arg=--mixup --extra-arg=0.0 \
   --extra-arg=--cutmix --extra-arg=0.0 \
