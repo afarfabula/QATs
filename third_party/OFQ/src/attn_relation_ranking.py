@@ -28,13 +28,17 @@ def extract_attention_list(attn_info):
     return extracted
 
 
-def attention_relation_ranking_loss(student_attn_info, teacher_attn_info, heads=None, topk: int = 1, eps: float = 1e-8):
+def attention_relation_ranking_loss(student_attn_info, teacher_attn_info, heads=None, topk: int = 1, eps: float = 1e-8, min_attn: float = 1e-4):
     """教师注意力大小关系的成对排序损失。
 
     教师在每个 (layer, head, query) 行内取 top-k 个 key，与所有教师分数严格更低的 key 组成有向对,
     用 softplus(-(log s_c - log s_d)) 要求学生在同样两个 key 上保持同样顺序。
     log 概率差等于 softmax 前的分数差, 因此等价于约束 QK 分数的大小关系。
-    teacher 值 ≤ 0 的位置（mask / dropout / 该 key 未被注意）与并列（ties）都不计入。
+
+    token 有效性: Swin 的 SW-MSA 窗口会把不同区域拼进同一个窗口, 被 mask 的 key 在 softmax 之后不是
+    干净的 0, 而是 0 或 ~1e-30 量级的 denormal。所以不能用 `> 0` 判断有效, 必须用阈值 `min_attn`
+    (默认 1e-4, 远高于 mask 残值、远低于有意义注意力的量级)。排序起点(top-k)本身也必须超过阈值,
+    并列（ties）依旧不计入。
 
     heads: None 表示使用所有 (layer, head)；也可以传 ((layer_idx, head_idx), ...) 只约束部分 head。
     返回 (loss, 有效对数)；没有任何有效对时返回 loss=0。
@@ -71,7 +75,9 @@ def attention_relation_ranking_loss(student_attn_info, teacher_attn_info, heads=
         teacher_head = teacher_attn[:, head_idx].detach().float()      # [B, Q, K]
         top_values, top_indices = teacher_head.topk(k, dim=-1)         # [B, Q, k]
         teacher_keys = teacher_head.unsqueeze(-2)
-        valid = (top_values.unsqueeze(-1) > teacher_keys) & (teacher_keys > 0)
+        teacher_top = top_values.unsqueeze(-1)
+        # 排序目标 key 与排序起点都必须是真的被注意到的 token（排除 SW-MSA mask / padding）。
+        valid = (teacher_top > teacher_keys) & (teacher_keys > min_attn) & (teacher_top > min_attn)
         pair_count = valid.sum(dim=(-1, -2))                           # [B, Q]
         rows = pair_count > 0
         if not bool(rows.any()):

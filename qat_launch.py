@@ -947,6 +947,9 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--teacher-attn-kl-weight-epoch-overrides", dest="teacher_attn_kl_weight_epoch_overrides", type=str)
     parser.add_argument("--attn-rank-weight", dest="attn_rank_weight", type=float)
     parser.add_argument("--attn-rank-topk", dest="attn_rank_topk", type=int)
+    parser.add_argument("--attn-rank-source", dest="attn_rank_source", type=str)
+    parser.add_argument("--attn-rank-min-attn", dest="attn_rank_min_attn", type=float)
+    parser.add_argument("--attn-rank-probe", dest="attn_rank_probe", action="store_true")
     parser.add_argument("--logit-rank-weight", dest="logit_rank_weight", type=float)
     parser.add_argument("--logit-rank-topk", dest="logit_rank_topk", type=int)
     parser.add_argument("--logit-rank-probe", dest="logit_rank_probe", action="store_true", help="只跑一次：打印 KD 与 logits-ranking 在学生 logits 上的梯度范数比，用来定权重")
@@ -1404,6 +1407,9 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "teacher_attn_kl_weight_epoch_overrides": "",
         "attn_rank_weight": 0.0,
         "attn_rank_topk": 1,
+        "attn_rank_source": "teacher",
+        "attn_rank_min_attn": 1e-4,
+        "attn_rank_probe": False,
         "logit_rank_weight": 0.0,
         "logit_rank_topk": 5,
         "logit_rank_probe": False,
@@ -1742,6 +1748,12 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["attn_rank_weight"] = args.attn_rank_weight
     if getattr(args, "attn_rank_topk", None) is not None:
         defaults["attn_rank_topk"] = args.attn_rank_topk
+    if getattr(args, "attn_rank_source", None) is not None:
+        defaults["attn_rank_source"] = args.attn_rank_source
+    if getattr(args, "attn_rank_min_attn", None) is not None:
+        defaults["attn_rank_min_attn"] = args.attn_rank_min_attn
+    if getattr(args, "attn_rank_probe", False):
+        defaults["attn_rank_probe"] = True
     if getattr(args, "logit_rank_weight", None) is not None:
         defaults["logit_rank_weight"] = args.logit_rank_weight
     if getattr(args, "logit_rank_topk", None) is not None:
@@ -2143,6 +2155,11 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["teacher_attn_kl_weight_epoch_overrides"] = parse_epoch_float_overrides(defaults.get("teacher_attn_kl_weight_epoch_overrides"))
     defaults["attn_rank_weight"] = float(defaults.get("attn_rank_weight", 0.0) or 0.0)
     defaults["attn_rank_topk"] = int(defaults.get("attn_rank_topk", 1) or 1)
+    defaults["attn_rank_source"] = str(defaults.get("attn_rank_source", "teacher") or "teacher").strip().lower()
+    if defaults["attn_rank_source"] not in {"teacher", "ref"}:
+        raise ValueError(f"attn_rank_source 只能是 teacher 或 ref，收到 {defaults['attn_rank_source']!r}")
+    defaults["attn_rank_min_attn"] = float(defaults.get("attn_rank_min_attn", 1e-4) or 1e-4)
+    defaults["attn_rank_probe"] = bool(defaults.get("attn_rank_probe", False))
     defaults["logit_rank_weight"] = float(defaults.get("logit_rank_weight", 0.0) or 0.0)
     defaults["logit_rank_topk"] = int(defaults.get("logit_rank_topk", 5) or 5)
     defaults["teacher_attn_output_weight"] = float(defaults["teacher_attn_output_weight"])
@@ -2575,7 +2592,10 @@ def create_ofq_teacher_model(runtime_args: SimpleNamespace) -> nn.Module:
         runtime_args.teacher_attn_kl_weight > 0
         or has_positive_epoch_override(getattr(runtime_args, "teacher_attn_kl_weight_epoch_overrides", None))
         or runtime_args.teacher_qk_rel_weight > 0
-        or getattr(runtime_args, "attn_rank_weight", 0.0) > 0
+        or (
+            getattr(runtime_args, "attn_rank_weight", 0.0) > 0
+            and str(getattr(runtime_args, "attn_rank_source", "teacher") or "teacher").strip().lower() == "teacher"
+        )
         or str(getattr(runtime_args, "ref_head_mode", "")).startswith("dynamic_teacher_agree_top")
     ):
         set_attention_mode(teacher, collect_attention=True, qqkkvv=qqkkvv)
@@ -6304,6 +6324,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     capture_act_bin_margin = runtime_args.act_bin_margin_weight > 0
     logged_teacher_attn_kl_debug = False
     logged_attn_rank_debug = False
+    logged_attn_rank_probe = False
     logged_logit_rank_debug = False
     logged_logit_rank_probe = False
     attn_rank_loss_fn = (
@@ -6539,6 +6560,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
 
                 teacher_attn_info = None
                 teacher_logit = None
+                ref_attn_info = None
                 if runtime_args.use_kd:
                     with torch.no_grad():
                         if runtime_args.teacher_type in {"deit", "swin"}:
@@ -6662,12 +6684,18 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 if runtime_args.ref_stop_updates > 0 and local_update_count >= runtime_args.ref_stop_updates:
                     current_ref_attn_kl_weight = 0.0
                     current_ref_logit_kl_weight = 0.0
+                attn_rank_source = str(getattr(runtime_args, "attn_rank_source", "teacher") or "teacher").strip().lower()
+                attn_rank_needs_ref = attn_rank_loss_fn is not None and attn_rank_source == "ref"
                 use_ref_scheme = (
                     runtime_args.train_scheme == "ema_ref_attn_kl"
                     and ref_model is not None
                     and epoch >= runtime_args.ref_warmup_epochs
                     and local_update_count >= runtime_args.ref_warmup_updates
-                    and (current_ref_attn_kl_weight > 0 or current_ref_logit_kl_weight > 0)
+                    and (
+                        current_ref_attn_kl_weight > 0
+                        or current_ref_logit_kl_weight > 0
+                        or attn_rank_needs_ref
+                    )
                 )
                 if use_ref_scheme:
                     with torch.no_grad():
@@ -6783,23 +6811,62 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                         components=runtime_args.teacher_qkv_rel_components,
                     )
                     loss = loss + runtime_args.teacher_qkv_rel_weight * teacher_qk_rel_loss
-                if attn_rank_loss_fn is not None and teacher_attn_info is not None:
-                    attn_rank_loss, attn_rank_pairs = attn_rank_loss_fn(
-                        student_attn_info,
-                        teacher_attn_info,
-                        heads=parse_ref_head_mode(runtime_args.ref_head_mode),
-                        topk=runtime_args.attn_rank_topk,
-                    )
-                    loss = loss + runtime_args.attn_rank_weight * attn_rank_loss
-                    if runtime_args.local_rank == 0 and not logged_attn_rank_debug:
-                        print(
-                            "Attention-relation ranking debug: "
-                            f"weight={runtime_args.attn_rank_weight}, topk={runtime_args.attn_rank_topk}, "
-                            f"head_mode={runtime_args.ref_head_mode}, valid_pairs={attn_rank_pairs}, "
-                            f"student_layers={len(extract_attn_prob_list(student_attn_info))}, "
-                            f"teacher_layers={len(extract_attn_prob_list(teacher_attn_info))}"
+                if attn_rank_loss_fn is not None:
+                    attn_rank_ref_info = ref_attn_info if attn_rank_source == "ref" else teacher_attn_info
+                    if attn_rank_ref_info is not None:
+                        attn_rank_loss, attn_rank_pairs = attn_rank_loss_fn(
+                            student_attn_info,
+                            attn_rank_ref_info,
+                            heads=parse_ref_head_mode(runtime_args.ref_head_mode),
+                            topk=runtime_args.attn_rank_topk,
+                            min_attn=runtime_args.attn_rank_min_attn,
                         )
-                        logged_attn_rank_debug = True
+                        if runtime_args.attn_rank_probe and not logged_attn_rank_probe:
+                            # 一次性权重定标探针：两个损失作用在同一个模型参数集上，比较参数梯度范数。
+                            # （不能用“收集到的注意力张量”当共享张量：开了 head 子集之后返回的 attn 是
+                            #   advanced indexing 的副本，base loss 走的是索引前的 attn，所以 dBase/dA ≡ 0。）
+                            try:
+                                probe_params = [p for p in model.parameters() if p.requires_grad]
+                                g_base = torch.autograd.grad(loss, probe_params, retain_graph=True, allow_unused=True)
+                                g_rank = torch.autograd.grad(attn_rank_loss, probe_params, retain_graph=True, allow_unused=True)
+
+                                def _total_norm(grads):
+                                    total = 0.0
+                                    touched = 0
+                                    for g in grads:
+                                        if g is None:
+                                            continue
+                                        touched += 1
+                                        total += float(g.detach().float().pow(2).sum())
+                                    return total ** 0.5, touched
+
+                                n_base, p_base = _total_norm(g_base)
+                                n_rank, p_rank = _total_norm(g_rank)
+                                print(
+                                    "AttnRank grad probe: "
+                                    f"||dBase/dtheta||={n_base:.4e} ({p_base} tensors) "
+                                    f"||dRank/dtheta||={n_rank:.4e} ({p_rank} tensors) "
+                                    f"ratio={n_base / max(n_rank, 1e-12):.4f} | "
+                                    f"lambda(rho=0.1)={0.1 * n_base / max(n_rank, 1e-12):.4g} "
+                                    f"lambda(rho=0.3)={0.3 * n_base / max(n_rank, 1e-12):.4g} "
+                                    f"lambda(rho=1.0)={1.0 * n_base / max(n_rank, 1e-12):.4g} "
+                                    f"| source={attn_rank_source}, valid_pairs={attn_rank_pairs}, "
+                                    f"local_rank={runtime_args.local_rank}"
+                                )
+                            except RuntimeError as exc:
+                                print(f"AttnRank grad probe failed: {exc}")
+                            logged_attn_rank_probe = True
+                        loss = loss + runtime_args.attn_rank_weight * attn_rank_loss
+                        if runtime_args.local_rank == 0 and not logged_attn_rank_debug:
+                            print(
+                                "Attention-relation ranking debug: "
+                                f"weight={runtime_args.attn_rank_weight}, topk={runtime_args.attn_rank_topk}, "
+                                f"source={attn_rank_source}, min_attn={runtime_args.attn_rank_min_attn}, "
+                                f"head_mode={runtime_args.ref_head_mode}, valid_pairs={attn_rank_pairs}, "
+                                f"student_layers={len(extract_attn_prob_list(student_attn_info))}, "
+                                f"ref_layers={len(extract_attn_prob_list(attn_rank_ref_info))}"
+                            )
+                            logged_attn_rank_debug = True
                 if logit_rank_loss_fn is not None and teacher_logit is not None:
                     logit_rank_loss, logit_rank_pairs = logit_rank_loss_fn(
                         student_logit,
@@ -7282,6 +7349,7 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
             print(
                 "Enabled attention-relation ranking: "
                 f"weight={runtime_args.attn_rank_weight}, topk={runtime_args.attn_rank_topk}, "
+                f"source={runtime_args.attn_rank_source}, min_attn={runtime_args.attn_rank_min_attn}, "
                 f"head_mode={runtime_args.ref_head_mode}"
             )
     load_initial_after_alpha = bool(runtime_args.initial_checkpoint and not runtime_args.eval_only)
@@ -8425,6 +8493,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-attn-kl-weight-epoch-overrides", dest="teacher_attn_kl_weight_epoch_overrides", type=str, default=None, help="按 epoch 覆盖 FP teacher attention KL 权重，格式 epoch:value,epoch:value")
     parser.add_argument("--attn-rank-weight", dest="attn_rank_weight", type=float, default=None, help="教师注意力大小关系（top-k key 成对排序）损失权重；>0 时自动开启注意力采集")
     parser.add_argument("--attn-rank-topk", dest="attn_rank_topk", type=int, default=None, help="每行取教师 top-k 个 key 作为排序起点，默认 1")
+    parser.add_argument("--attn-rank-source", dest="attn_rank_source", type=str, default=None, choices=["teacher", "ref"], help="attention-relation ranking 的参考来源：teacher（默认）或 ref（ema/prev-step 参考模型，需要 --train-scheme ema_ref_attn_kl）")
+    parser.add_argument("--attn-rank-min-attn", dest="attn_rank_min_attn", type=float, default=None, help="判定 key 为有效 token 的注意力阈值（排除 SW-MSA mask 的 denormal 残值），默认 1e-4")
+    parser.add_argument("--attn-rank-probe", dest="attn_rank_probe", action="store_true", help="只跑一次：打印 base loss 与 attn-ranking 在共享 attention 张量上的梯度范数比，用来定权重")
     parser.add_argument("--logit-rank-weight", dest="logit_rank_weight", type=float, default=None, help="教师分类 logits 的 top-k 类别成对排序损失权重")
     parser.add_argument("--logit-rank-topk", dest="logit_rank_topk", type=int, default=None, help="取教师 top-k 个类别作为排序起点，默认 5")
     parser.add_argument("--teacher-attn-output-weight", dest="teacher_attn_output_weight", type=float, default=None, help="FP teacher attention module output MSE 权重")
