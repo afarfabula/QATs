@@ -33,8 +33,12 @@ MAX_UPDATES="${MAX_UPDATES:-0}"      # >0 时提前停止（按 optimizer step �
 PROBE="${PROBE:-0}"                  # 1 = 只跑一次梯度范数探针，用来定权重
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
 RANK_TARGET="${RANK_TARGET:-post_quant}"   # post_quant / post_quant_detached_scale / pre_quant
+RANK_SOURCE="${RANK_SOURCE:-ref}"          # ref(prev-step 自己) / teacher(FP 固定锚)
 FREEZE_S="${FREEZE_S:-0}"                  # 1 = 冻结注意力 softmax 的 LSQ 步长 s
 FREEZE_SUFFIX="${FREEZE_SUFFIX:-}"         # 逗号分隔的参数名子串,粘性冻结
+REF_KL_W="${REF_KL_W:-0}"                  # >0 时改用老的 naive ref attention-KL(此时把 RANK_W 设 0)
+REF_KL_CLIP="${REF_KL_CLIP:-0}"            # 0 = 不裁剪(旧 run 的 20.0 会一直贴在 clip 上)
+TEACHER_KL_W="${TEACHER_KL_W:-0}"          # >0 时改用 FP teacher 的 naive attention-KL(固定锚)
 HINGE="${HINGE:-0}"                        # 1 = 用 relu(margin-Delta) 替代 softplus(-Delta)
 MARGIN="${MARGIN:-0}"                      # hinge 的目标 margin
 SAVE_STEPS="${SAVE_STEPS:-0}"              # 1 = 按 optimizer step 存 checkpoint（离线评估用）
@@ -83,9 +87,9 @@ fi
   echo "TEACHER=${TEACHER}"
   echo "DEVICES=${DEVICES}  nproc=${NPROC}  batch=32/GPU  accum=ceil(16/${NPROC})=?  -> 512 images/optimizer step"
   echo "layers=8,9,10,11 (all heads)  n_head_slots=$(echo -n "${HEADS}" | tr ',' '\n' | wc -l)"
-  echo "attn_rank_weight=${RANK_W}  topk=${RANK_TOPK}  min_attn=${RANK_MIN_ATTN}  source=ref"
+  echo "attn_rank_weight=${RANK_W}  topk=${RANK_TOPK}  min_attn=${RANK_MIN_ATTN}  source=${RANK_SOURCE}"
   echo "attn_rank_target=${RANK_TARGET}  freeze_attn_softmax_scale=${FREEZE_S}  freeze_suffix=${FREEZE_SUFFIX}"
-  echo "hinge=${HINGE}  margin=${MARGIN}"
+  echo "hinge=${HINGE}  margin=${MARGIN}  ref_attn_kl_weight=${REF_KL_W}  teacher_attn_kl_weight=${TEACHER_KL_W}  ref_attn_kl_clip=${REF_KL_CLIP}"
   echo "ref_update=prev_step  ref_update_interval=${REF_INTERVAL}"
   echo "max_train_updates=${MAX_UPDATES}  probe=${PROBE}"
   nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader || true
@@ -115,9 +119,11 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTHONUNBUFFERED=1 \
   --quantized --qk-reparam --qk-reparam-type 0 \
   --amp --amp-dtype bf16 \
   --train-scheme ema_ref_attn_kl --ref-update prev_step --ref-update-interval "${REF_INTERVAL}" \
-  --ref-attn-kl-weight 0.0 --ref-logit-kl-weight 0.0 \
+  --ref-attn-kl-weight "${REF_KL_W}" --ref-logit-kl-weight 0.0 \
+  --ref-attn-kl-clip "${REF_KL_CLIP}" --ref-attn-kl-drop-prob 1.0 --ref-attn-loss kl_ref \
+  --teacher-attn-kl-weight "${TEACHER_KL_W}" --teacher-attn-kl-warmup-epochs 0 \
   --ref-head-mode "${HEADS}" \
-  --attn-rank-weight "${RANK_W}" --attn-rank-source ref \
+  --attn-rank-weight "${RANK_W}" --attn-rank-source "${RANK_SOURCE}" \
   --attn-rank-topk "${RANK_TOPK}" --attn-rank-min-attn "${RANK_MIN_ATTN}" \
   --attn-rank-target "${RANK_TARGET}" \
   --extra-arg=--smoothing --extra-arg=0.1 \
