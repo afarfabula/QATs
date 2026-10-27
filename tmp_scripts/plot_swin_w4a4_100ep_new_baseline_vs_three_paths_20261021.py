@@ -128,7 +128,7 @@ def main() -> None:
     ax.set_xlabel("训练轮次 epoch")
     ax.set_ylabel("ImageNet Top-1 (%)")
     ax.set_title(
-        "Swin-T W4A4 100 epoch：本地 logit-rank / teacher attention-rank 与旧 trainer 三条轨迹\n"
+        "Swin-T W4A4 100 epoch：两种 rank 损失与旧三条 KL 轨迹\n"
         "（每轮 50k 全量验证，effective batch 512）"
     )
     ax.grid(alpha=0.3)
@@ -136,10 +136,10 @@ def main() -> None:
     ax.text(
         0.012,
         0.028,
-        "共同配方：public pretrained 学生 + FP Swin-T teacher，2e-4 → 5e-6 100ep 余弦；"
-        "effective batch 512\n"
-        "红/紫为本机 qat_launch 4×3090；黑/橙/绿为旧 trainer 归档，作为同规模背景对比\n"
-        "注意：本地两条都含辅助损失；纯 λ=0 同路径只跑到 10ep（79.6640）",
+        "红/紫为本地 qat_launch 4×3090：红=logit-rank，紫=teacher attention-rank；"
+        "两条都含辅助损失\n"
+        "黑/橙/绿为旧 trainer 的 KL 抑制轨迹，作为同规模背景对比；"
+        "纯 λ=0 同路径只跑到 10ep",
         transform=ax.transAxes,
         fontsize=7.9,
         color="0.30",
