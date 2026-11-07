@@ -5392,6 +5392,26 @@ def teacher_confidence_weighted_soft_kd(student_logits: torch.Tensor, teacher_lo
     return (per_sample_loss * weights).mean()
 
 
+def collapse_deit_distilled_logits(logits):
+    """Use both DeiT heads during training and match the model's eval behavior.
+
+    HuggingFace/timm DeiT distilled models return ``(cls_logits, dist_logits)``
+    while training and their average while evaluating. The previous OFQ
+    extraction kept only ``cls_logits``, leaving ``head_dist`` without a
+    gradient and triggering DDP's unused-parameter error. Averaging here keeps
+    both heads in the objective and makes train/eval logits consistent.
+    """
+    if not isinstance(logits, (tuple, list)):
+        return logits
+    if not logits or not all(torch.is_tensor(item) for item in logits):
+        return logits
+    if len(logits) == 1:
+        return logits[0]
+    if any(item.shape != logits[0].shape for item in logits[1:]):
+        raise ValueError("DeiT head logits must have identical shapes")
+    return torch.stack(tuple(logits), dim=0).mean(dim=0)
+
+
 def teacher_soft_kd_with_temperature(student_logits: torch.Tensor, teacher_logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
     return teacher_confidence_weighted_soft_kd(
         student_logits,
@@ -6274,6 +6294,10 @@ def compute_ofq_batch_loss(input, target, model: nn.Module, loss_fn, runtime_arg
             else:
                 teacher_logit = teacher_output
                 teacher_attn_info = None
+            if runtime_args.model_type == "deit":
+                student_logit = collapse_deit_distilled_logits(student_logit)
+            if runtime_args.teacher_type == "deit":
+                teacher_logit = collapse_deit_distilled_logits(teacher_logit)
             if runtime_args.kd_hard_and_soft == 0:
                 if runtime_args.teacher_confidence_kd_power > 0:
                     loss = teacher_confidence_weighted_soft_kd(
@@ -6663,6 +6687,10 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                     else:
                         teacher_logit = teacher_output
                         teacher_attn_info = None
+                    if runtime_args.model_type == "deit":
+                        student_logit = collapse_deit_distilled_logits(student_logit)
+                    if runtime_args.teacher_type == "deit":
+                        teacher_logit = collapse_deit_distilled_logits(teacher_logit)
 
                     if runtime_args.kd_hard_and_soft == 0:
                         if runtime_args.teacher_confidence_kd_power > 0:

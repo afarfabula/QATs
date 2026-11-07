@@ -18,6 +18,23 @@ data=/tmp/imagenet1k_full_parquet
 full validation samples=50000
 ```
 
+### DeiT-Tiny 100epoch baseline
+
+当前训练链路支持 DeiT 蒸馏模型的双分类头。训练时 `cls` 和 `dist`
+两个 head 的 logits 先取平均，再计算纯 soft KD；这与模型 eval
+时返回两个 head 平均值的行为一致，同时保证 `head_dist` 不会成为
+DDP 未使用参数。
+
+双卡 100epoch 基线入口：
+
+```bash
+DEVICES=4,7 \
+  bash tmp_scripts/run_deit_tiny_w4a4_baseline_100ep_2gpu_20261107.sh
+```
+
+配方、smoke 结果和运行状态见
+`docs/deit_tiny_w4a4_baseline_100ep_20261107.md`。
+
 ## 三条 100epoch 轨迹
 
 以下三条曲线都已经完整归档在 `experiment_logs/fullval_ge10/`，每条都有 100 个 `Test: [distributed-summary]` full validation 点，并且每个点都是 `Samples: 50000`。
