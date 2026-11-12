@@ -9,6 +9,21 @@ from .qlinear import QLinear, LSQ_w_and_act_QLinear
 from ..quantizer.lsq import LsqQuantizer, LsqQuantizer4v
 from ..quantizer.statsq import StatsQuantizer, StatsQuantizer_specific_4_qkreparam_cga
 
+
+def maybe_renormalize_post_quant_attention(module, attn_prob):
+    """Restore attention row mass consumed by finite-step probability quantization."""
+    if not bool(getattr(module, "attention_softmax_post_quant_renorm", False)):
+        return attn_prob
+    return attn_prob / attn_prob.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
+def maybe_quantize_attention_prob(module, attn_prob):
+    """Optional diagnostic bypass for the post-softmax activation quantizer."""
+    if bool(getattr(module, "attention_softmax_fp", False)):
+        return attn_prob
+    return module.quan_a_softmax_fn(attn_prob)
+
+
 class QAttention(deit_attention):
     def __init__(self, m: deit_attention, weight_bits=8, input_bits=8, aq_learnable=True, wq_learnable = True,
                  weight_channelwise=True, input_channelwise=True, weight_quant_method="statsq", input_quant_method="lsq",
@@ -63,6 +78,8 @@ class QAttention(deit_attention):
         self.move_v_aft = LearnableBias(m.qkv.in_features)
 
         self.quan_a_softmax_fn = LsqQuantizer(bit=input_bits,all_positive=True,per_channel=True, learnable =  aq_learnable)
+        self.capture_attn_quant_output = False
+        self._last_attn_quant_output_pair = None
 
     def forward(self, x):
         B, N, C = x.shape
@@ -95,12 +112,18 @@ class QAttention(deit_attention):
 
         attn_weights = (q @ k.transpose(-2, -1).contiguous()) * self.scale
         attn_prob = F.softmax(attn_weights, dim=-1)
+        attn_prob_pre_quant = attn_prob if self.capture_attn_quant_output else None
 
-        attn_prob = self.quan_a_softmax_fn(attn_prob)
+        attn_prob = maybe_quantize_attention_prob(self, attn_prob)
+        attn_prob = maybe_renormalize_post_quant_attention(self, attn_prob)
         collected_attn = select_attention_heads(attn_prob, self) if self.collect_attention else None
         attn_prob = self.attn_drop(attn_prob)
 
-        x = (attn_prob @ v).transpose(1, 2).reshape(B, N, C)
+        attn_output = attn_prob @ v
+        if self.capture_attn_quant_output and attn_prob_pre_quant is not None:
+            pre_quant_attn_output = attn_prob_pre_quant @ v
+            self._last_attn_quant_output_pair = (pre_quant_attn_output, attn_output)
+        x = attn_output.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x, collected_attn
@@ -168,6 +191,8 @@ class QAttention_qkreparam(deit_attention):
         self.move_v_aft = LearnableBias(m.qkv.in_features)
 
         self.quan_a_softmax_fn = LsqQuantizer(bit=input_bits,all_positive=True,per_channel=True, learnable =  aq_learnable)
+        self.capture_attn_quant_output = False
+        self._last_attn_quant_output_pair = None
         
         ## no longer need qkv
         del self.qkv
@@ -213,12 +238,18 @@ class QAttention_qkreparam(deit_attention):
         value_4_softmax = xqkx
         attn_weights = (value_4_softmax) * self.scale
         attn_prob = F.softmax(attn_weights, dim=-1)
+        attn_prob_pre_quant = attn_prob if self.capture_attn_quant_output else None
 
-        attn_prob = self.quan_a_softmax_fn(attn_prob)
+        attn_prob = maybe_quantize_attention_prob(self, attn_prob)
+        attn_prob = maybe_renormalize_post_quant_attention(self, attn_prob)
         collected_attn = select_attention_heads(attn_prob, self) if self.collect_attention else None
         attn_prob = self.attn_drop(attn_prob)
 
-        x = (attn_prob @ v).transpose(1, 2).reshape(B, N, C)
+        attn_output = attn_prob @ v
+        if self.capture_attn_quant_output and attn_prob_pre_quant is not None:
+            pre_quant_attn_output = attn_prob_pre_quant @ v
+            self._last_attn_quant_output_pair = (pre_quant_attn_output, attn_output)
+        x = attn_output.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x, collected_attn
@@ -332,7 +363,8 @@ class QAttention_qkreparam_4_cga(deit_attention):
         attn_weights = (value_4_softmax) * self.scale
         attn_prob = F.softmax(attn_weights, dim=-1)
 
-        attn_prob = self.quan_a_softmax_fn(attn_prob)
+        attn_prob = maybe_quantize_attention_prob(self, attn_prob)
+        attn_prob = maybe_renormalize_post_quant_attention(self, attn_prob)
         collected_attn = select_attention_heads(attn_prob, self) if self.collect_attention else None
         attn_prob = self.attn_drop(attn_prob)
 
@@ -431,7 +463,8 @@ class QAttention_lsq(deit_attention):
         attn_weights = (q @ k.transpose(-2, -1).contiguous()) * self.scale
         attn_prob = F.softmax(attn_weights, dim=-1)
 
-        attn_prob = self.quan_a_softmax_fn(attn_prob)
+        attn_prob = maybe_quantize_attention_prob(self, attn_prob)
+        attn_prob = maybe_renormalize_post_quant_attention(self, attn_prob)
         collected_attn = select_attention_heads(attn_prob, self) if self.collect_attention else None
         attn_prob = self.attn_drop(attn_prob)
 

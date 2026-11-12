@@ -675,6 +675,7 @@ def build_ofq(args: argparse.Namespace) -> Tuple[List[str], Path, Dict[str, str]
     append_optional_value(command, "--variation-trust-start-update", getattr(args, "variation_trust_start_update", None))
     append_optional_value(command, "--aoq-explore-scale-ratio", getattr(args, "aoq_explore_scale_ratio", None))
     append_optional_value(command, "--aoq-explore-threshold-ratio", getattr(args, "aoq_explore_threshold_ratio", None))
+    append_optional_flag(command, "--aoq-explore-attention-softmax", getattr(args, "aoq_explore_attention_softmax", False))
     append_optional_value(command, "--aoq-explore-layers", getattr(args, "aoq_explore_layers", None))
     append_optional_value(command, "--aoq-explore-layer-ratios", getattr(args, "aoq_explore_layer_ratios", None))
     append_optional_value(command, "--aoq-explore-selective-margin", getattr(args, "aoq_explore_selective_margin", None))
@@ -923,6 +924,12 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--use-token-kd", dest="use_token_kd", action="store_true")
     parser.add_argument("--kd-alpha", dest="kd_alpha", type=float)
     parser.add_argument("--kd_hard_and_soft", type=int)
+    parser.add_argument(
+        "--ofq-official-kd-heads",
+        dest="ofq_official_kd_heads",
+        action="store_true",
+        help="match official OFQ DeiT KD: CE on cls head and soft KL on dist head",
+    )
     parser.add_argument("--kd-type", dest="kd_type", type=str)
     parser.add_argument("--qk_reparam_type", type=int)
     parser.add_argument("--warmup-lr", dest="warmup_lr", type=float)
@@ -955,6 +962,19 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--freeze-param-suffix", dest="freeze_param_suffix", type=str)
     parser.add_argument("--attn-rank-hinge", dest="attn_rank_hinge", action="store_true")
     parser.add_argument("--attn-rank-margin", dest="attn_rank_margin", type=float)
+    parser.add_argument("--attention-quant-weight", dest="attention_quant_weight", type=float)
+    parser.add_argument("--attention-quant-jsd-weight", dest="attention_quant_jsd_weight", type=float)
+    parser.add_argument("--attention-quant-mass-weight", dest="attention_quant_mass_weight", type=float)
+    parser.add_argument("--attention-quant-topk-mass-weight", dest="attention_quant_topk_mass_weight", type=float)
+    parser.add_argument("--attention-quant-topk", dest="attention_quant_topk", type=int)
+    parser.add_argument("--attention-quant-probe", dest="attention_quant_probe", action="store_true")
+    parser.add_argument("--attention-softmax-post-quant-renorm", dest="attention_softmax_post_quant_renorm", action="store_true")
+    parser.add_argument("--attention-softmax-fp", dest="attention_softmax_fp", action="store_true")
+    parser.add_argument("--attention-softmax-fp-layers", dest="attention_softmax_fp_layers", type=str)
+    parser.add_argument("--activation-quant-fp", dest="activation_quant_fp", action="store_true")
+    parser.add_argument("--activation-quant-fp-suffixes", dest="activation_quant_fp_suffixes", type=str)
+    parser.add_argument("--attention-output-weight", dest="attention_output_weight", type=float)
+    parser.add_argument("--attention-output-probe", dest="attention_output_probe", action="store_true")
     parser.add_argument("--logit-rank-weight", dest="logit_rank_weight", type=float)
     parser.add_argument("--logit-rank-topk", dest="logit_rank_topk", type=int)
     parser.add_argument("--logit-rank-probe", dest="logit_rank_probe", action="store_true", help="只跑一次：打印 KD 与 logits-ranking 在学生 logits 上的梯度范数比，用来定权重")
@@ -1003,6 +1023,8 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--quant-slow-state-policy", dest="quant_slow_state_policy", type=str)
     parser.add_argument("--quant-slow-state-observe-start-epoch", dest="quant_slow_state_observe_start_epoch", type=int)
     parser.add_argument("--quant-slow-state-start-epoch", dest="quant_slow_state_start_epoch", type=int)
+    parser.add_argument("--lsq-scale-floor", dest="lsq_scale_floor", type=float)
+    parser.add_argument("--lsq-scale-floor-target", dest="lsq_scale_floor_target", type=str)
     parser.add_argument("--act-scale-anchor-weight", dest="act_scale_anchor_weight", type=float)
     parser.add_argument("--act-scale-anchor-layers", dest="act_scale_anchor_layers", type=str)
     parser.add_argument("--act-scale-anchor-start-epoch", dest="act_scale_anchor_start_epoch", type=int)
@@ -1018,6 +1040,7 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--variation-trust-start-update", dest="variation_trust_start_update", type=int)
     parser.add_argument("--aoq-explore-scale-ratio", dest="aoq_explore_scale_ratio", type=float)
     parser.add_argument("--aoq-explore-threshold-ratio", dest="aoq_explore_threshold_ratio", type=float)
+    parser.add_argument("--aoq-explore-attention-softmax", dest="aoq_explore_attention_softmax", action="store_true")
     parser.add_argument("--aoq-explore-layers", dest="aoq_explore_layers", type=str)
     parser.add_argument("--aoq-explore-layer-ratios", dest="aoq_explore_layer_ratios", type=str)
     parser.add_argument("--aoq-explore-selective-margin", dest="aoq_explore_selective_margin", type=float)
@@ -1378,6 +1401,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "apply_q_attn_dropout": 0,
         "act_layer": "gelu",
         "kd_hard_and_soft": 1,
+        "ofq_official_kd_heads": False,
         "teacher_type": "swin",
         "pretrained_initialized": False,
         "qk_reparam": False,
@@ -1420,6 +1444,19 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "freeze_param_suffix": "",
         "attn_rank_hinge": False,
         "attn_rank_margin": 0.0,
+        "attention_quant_weight": 0.0,
+        "attention_quant_jsd_weight": 1.0,
+        "attention_quant_mass_weight": 1.0,
+        "attention_quant_topk_mass_weight": 0.0,
+        "attention_quant_topk": 5,
+        "attention_quant_probe": False,
+        "attention_softmax_post_quant_renorm": False,
+        "attention_softmax_fp": False,
+        "attention_softmax_fp_layers": "",
+        "activation_quant_fp": False,
+        "activation_quant_fp_suffixes": "",
+        "attention_output_weight": 0.0,
+        "attention_output_probe": False,
         "logit_rank_weight": 0.0,
         "logit_rank_topk": 5,
         "logit_rank_probe": False,
@@ -1486,6 +1523,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "quant_slow_state_policy": "all",
         "quant_slow_state_observe_start_epoch": 0,
         "quant_slow_state_start_epoch": 0,
+        "lsq_scale_floor": 0.0,
+        "lsq_scale_floor_target": "attention_softmax",
         "act_scale_anchor_weight": 0.0,
         "act_scale_anchor_layers": "",
         "act_scale_anchor_start_epoch": 0,
@@ -1501,6 +1540,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "variation_trust_start_update": 0,
         "aoq_explore_scale_ratio": 1.0,
         "aoq_explore_threshold_ratio": 0.0,
+        "aoq_explore_attention_softmax": False,
         "aoq_explore_layers": "",
         "aoq_explore_layer_ratios": "",
         "aoq_explore_selective_margin": 0.0,
@@ -1670,6 +1710,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["kd_hard_and_soft"] = args.kd_hard_and_soft
     elif args.use_kd and defaults.get("kd_hard_and_soft", 0) == 0:
         defaults["kd_hard_and_soft"] = 1
+    if getattr(args, "ofq_official_kd_heads", False):
+        defaults["ofq_official_kd_heads"] = True
     if args.qk_reparam_type is not None:
         defaults["qk_reparam_type"] = args.qk_reparam_type
 
@@ -1774,6 +1816,32 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["attn_rank_hinge"] = True
     if getattr(args, "attn_rank_margin", None) is not None:
         defaults["attn_rank_margin"] = args.attn_rank_margin
+    if getattr(args, "attention_quant_weight", None) is not None:
+        defaults["attention_quant_weight"] = args.attention_quant_weight
+    if getattr(args, "attention_quant_jsd_weight", None) is not None:
+        defaults["attention_quant_jsd_weight"] = args.attention_quant_jsd_weight
+    if getattr(args, "attention_quant_mass_weight", None) is not None:
+        defaults["attention_quant_mass_weight"] = args.attention_quant_mass_weight
+    if getattr(args, "attention_quant_topk_mass_weight", None) is not None:
+        defaults["attention_quant_topk_mass_weight"] = args.attention_quant_topk_mass_weight
+    if getattr(args, "attention_quant_topk", None) is not None:
+        defaults["attention_quant_topk"] = args.attention_quant_topk
+    if getattr(args, "attention_quant_probe", False):
+        defaults["attention_quant_probe"] = True
+    if getattr(args, "attention_softmax_post_quant_renorm", False):
+        defaults["attention_softmax_post_quant_renorm"] = True
+    if getattr(args, "attention_softmax_fp", False):
+        defaults["attention_softmax_fp"] = True
+    if getattr(args, "attention_softmax_fp_layers", None) is not None:
+        defaults["attention_softmax_fp_layers"] = args.attention_softmax_fp_layers
+    if getattr(args, "activation_quant_fp", False):
+        defaults["activation_quant_fp"] = True
+    if getattr(args, "activation_quant_fp_suffixes", None) is not None:
+        defaults["activation_quant_fp_suffixes"] = args.activation_quant_fp_suffixes
+    if getattr(args, "attention_output_weight", None) is not None:
+        defaults["attention_output_weight"] = args.attention_output_weight
+    if getattr(args, "attention_output_probe", False):
+        defaults["attention_output_probe"] = True
     if getattr(args, "logit_rank_weight", None) is not None:
         defaults["logit_rank_weight"] = args.logit_rank_weight
     if getattr(args, "logit_rank_topk", None) is not None:
@@ -1904,6 +1972,10 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["quant_slow_state_observe_start_epoch"] = args.quant_slow_state_observe_start_epoch
     if getattr(args, "quant_slow_state_start_epoch", None) is not None:
         defaults["quant_slow_state_start_epoch"] = args.quant_slow_state_start_epoch
+    if getattr(args, "lsq_scale_floor", None) is not None:
+        defaults["lsq_scale_floor"] = args.lsq_scale_floor
+    if getattr(args, "lsq_scale_floor_target", None) is not None:
+        defaults["lsq_scale_floor_target"] = args.lsq_scale_floor_target
     if getattr(args, "act_scale_anchor_weight", None) is not None:
         defaults["act_scale_anchor_weight"] = args.act_scale_anchor_weight
     if getattr(args, "act_scale_anchor_layers", None) is not None:
@@ -1934,6 +2006,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["aoq_explore_scale_ratio"] = args.aoq_explore_scale_ratio
     if getattr(args, "aoq_explore_threshold_ratio", None) is not None:
         defaults["aoq_explore_threshold_ratio"] = args.aoq_explore_threshold_ratio
+    if getattr(args, "aoq_explore_attention_softmax", False):
+        defaults["aoq_explore_attention_softmax"] = True
     if getattr(args, "aoq_explore_layers", None) is not None:
         defaults["aoq_explore_layers"] = args.aoq_explore_layers
     if getattr(args, "aoq_explore_layer_ratios", None) is not None:
@@ -2194,6 +2268,31 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["_sticky_freeze_suffixes"] = tuple(dict.fromkeys(sticky_freeze))
     defaults["attn_rank_hinge"] = bool(defaults.get("attn_rank_hinge", False))
     defaults["attn_rank_margin"] = float(defaults.get("attn_rank_margin", 0.0) or 0.0)
+    defaults["attention_quant_weight"] = float(defaults.get("attention_quant_weight", 0.0) or 0.0)
+    defaults["attention_quant_jsd_weight"] = float(defaults.get("attention_quant_jsd_weight", 1.0) or 0.0)
+    defaults["attention_quant_mass_weight"] = float(defaults.get("attention_quant_mass_weight", 1.0) or 0.0)
+    defaults["attention_quant_topk_mass_weight"] = float(defaults.get("attention_quant_topk_mass_weight", 0.0) or 0.0)
+    defaults["attention_quant_topk"] = int(defaults.get("attention_quant_topk", 5) or 5)
+    defaults["attention_quant_probe"] = bool(defaults.get("attention_quant_probe", False))
+    defaults["attention_softmax_post_quant_renorm"] = bool(defaults.get("attention_softmax_post_quant_renorm", False))
+    defaults["attention_softmax_fp"] = bool(defaults.get("attention_softmax_fp", False))
+    defaults["attention_softmax_fp_layers"] = str(defaults.get("attention_softmax_fp_layers", "") or "")
+    defaults["activation_quant_fp"] = bool(defaults.get("activation_quant_fp", False))
+    defaults["activation_quant_fp_suffixes"] = str(defaults.get("activation_quant_fp_suffixes", "") or "")
+    if defaults["attention_quant_weight"] < 0:
+        raise ValueError("attention_quant_weight must be non-negative")
+    if defaults["attention_quant_jsd_weight"] < 0:
+        raise ValueError("attention_quant_jsd_weight must be non-negative")
+    if defaults["attention_quant_mass_weight"] < 0:
+        raise ValueError("attention_quant_mass_weight must be non-negative")
+    if defaults["attention_quant_topk_mass_weight"] < 0:
+        raise ValueError("attention_quant_topk_mass_weight must be non-negative")
+    if defaults["attention_quant_topk"] < 1:
+        raise ValueError("attention_quant_topk must be at least 1")
+    defaults["attention_output_weight"] = float(defaults.get("attention_output_weight", 0.0) or 0.0)
+    defaults["attention_output_probe"] = bool(defaults.get("attention_output_probe", False))
+    if defaults["attention_output_weight"] < 0:
+        raise ValueError("attention_output_weight must be non-negative")
     defaults["logit_rank_weight"] = float(defaults.get("logit_rank_weight", 0.0) or 0.0)
     defaults["logit_rank_topk"] = int(defaults.get("logit_rank_topk", 5) or 5)
     defaults["teacher_attn_output_weight"] = float(defaults["teacher_attn_output_weight"])
@@ -2299,10 +2398,16 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["quant_slow_state_sync_interval"] = int(defaults.get("quant_slow_state_sync_interval", 0))
     defaults["quant_slow_state_pull"] = float(defaults.get("quant_slow_state_pull", 0.0))
     defaults["quant_slow_state_policy"] = str(defaults.get("quant_slow_state_policy", "all"))
-    if defaults["quant_slow_state_policy"] not in {"all", "activation"}:
+    if defaults["quant_slow_state_policy"] not in {"all", "activation", "attention_softmax"}:
         raise ValueError(f"Unsupported quant_slow_state_policy: {defaults['quant_slow_state_policy']}")
     defaults["quant_slow_state_observe_start_epoch"] = int(defaults.get("quant_slow_state_observe_start_epoch", 0))
     defaults["quant_slow_state_start_epoch"] = int(defaults.get("quant_slow_state_start_epoch", 0))
+    defaults["lsq_scale_floor"] = float(defaults.get("lsq_scale_floor", 0.0))
+    defaults["lsq_scale_floor_target"] = str(defaults.get("lsq_scale_floor_target", "attention_softmax"))
+    if defaults["lsq_scale_floor"] < 0:
+        raise ValueError("lsq_scale_floor must be non-negative")
+    if defaults["lsq_scale_floor_target"] not in {"attention_softmax", "activation"}:
+        raise ValueError(f"Unsupported lsq_scale_floor_target: {defaults['lsq_scale_floor_target']}")
     defaults["act_scale_anchor_weight"] = float(defaults.get("act_scale_anchor_weight", 0.0))
     defaults["act_scale_anchor_layers"] = str(defaults.get("act_scale_anchor_layers", ""))
     defaults["act_scale_anchor_start_epoch"] = int(defaults.get("act_scale_anchor_start_epoch", 0))
@@ -2318,6 +2423,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["variation_trust_start_update"] = int(defaults.get("variation_trust_start_update", 0))
     defaults["aoq_explore_scale_ratio"] = float(defaults.get("aoq_explore_scale_ratio", 1.0))
     defaults["aoq_explore_threshold_ratio"] = float(defaults.get("aoq_explore_threshold_ratio", 0.0))
+    defaults["aoq_explore_attention_softmax"] = bool(defaults.get("aoq_explore_attention_softmax", False))
     defaults["aoq_explore_layers"] = str(defaults.get("aoq_explore_layers", ""))
     defaults["aoq_explore_layer_ratios"] = str(defaults.get("aoq_explore_layer_ratios", ""))
     defaults["aoq_explore_selective_margin"] = float(defaults.get("aoq_explore_selective_margin", 0.0))
@@ -3123,6 +3229,207 @@ def activation_bin_margin_loss(
     return total_loss, total_pairs
 
 
+def install_attention_quantization_hooks(
+    model: nn.Module,
+) -> Tuple[List[Tuple[str, torch.Tensor, torch.Tensor]], List[object]]:
+    """Capture the pre/post-quant tensors of every attention softmax quantizer."""
+    captures: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
+    handles: List[object] = []
+    for name, module in model.named_modules():
+        if not name.endswith("quan_a_softmax_fn"):
+            continue
+        if not hasattr(module, "forward_detached_scale"):
+            continue
+
+        def _capture(_module, inputs, output, layer_name=name):
+            if not inputs or not torch.is_tensor(inputs[0]) or not torch.is_tensor(output):
+                return
+            captures.append((layer_name, inputs[0], output))
+
+        handles.append(module.register_forward_hook(_capture))
+    return captures, handles
+
+
+def attention_quantization_fidelity_loss(
+    captures: Sequence[Tuple[str, torch.Tensor, torch.Tensor]],
+    jsd_weight: float = 1.0,
+    mass_weight: float = 1.0,
+    topk_mass_weight: float = 0.0,
+    topk: int = 5,
+    meaningful_threshold: float = 1e-4,
+    collect_metrics: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Teacher-free fidelity between pre-quant and post-quant attention.
+
+    The distribution term compares row-normalized probabilities with JSD. A separate
+    relative row-mass error prevents normalized shape matching from hiding the fact
+    that 4-bit quantization deleted a substantial fraction of the row mass.
+    """
+    if not captures:
+        raise ValueError("attention_quantization_fidelity_loss received no captures")
+
+    total = None
+    num_layers = 0
+    jsd_sum = 0.0
+    mass_error_sum = 0.0
+    zero_meaningful_sum = 0.0
+    meaningful_sum = 0.0
+    post_zero_sum = 0.0
+    element_sum = 0.0
+    topk_error_sum = 0.0
+    topk_retention_sum = 0.0
+
+    for _name, pre, post in captures:
+        pre = pre.float()
+        post = post.float()
+        if pre.shape != post.shape or pre.ndim < 2:
+            continue
+
+        pre_sum = pre.sum(dim=-1, keepdim=True)
+        post_sum = post.sum(dim=-1, keepdim=True)
+        pre_prob = pre / pre_sum.clamp_min(1e-8)
+        post_prob = post / post_sum.clamp_min(1e-8)
+        midpoint = 0.5 * (pre_prob + post_prob)
+        midpoint_log = midpoint.clamp_min(1e-12).log()
+        pre_log = pre_prob.clamp_min(1e-12).log()
+        post_log = post_prob.clamp_min(1e-12).log()
+        jsd_rows = 0.5 * (
+            (pre_prob * (pre_log - midpoint_log)).sum(dim=-1)
+            + (post_prob * (post_log - midpoint_log)).sum(dim=-1)
+        )
+        jsd = jsd_rows.mean()
+
+        relative_mass_error = (
+            (post_sum - pre_sum) / pre_sum.clamp_min(1e-8)
+        ).pow(2).mean()
+        layer_loss = float(jsd_weight) * jsd + float(mass_weight) * relative_mass_error
+        k = min(max(1, int(topk)), pre.shape[-1])
+        top_indices = pre.topk(k, dim=-1).indices
+        pre_topk_mass = pre.gather(-1, top_indices).sum(dim=-1)
+        post_topk_mass = post.gather(-1, top_indices).sum(dim=-1)
+        topk_relative_error = (
+            (post_topk_mass - pre_topk_mass) / pre_topk_mass.clamp_min(1e-6)
+        ).pow(2).mean()
+        layer_loss = layer_loss + float(topk_mass_weight) * topk_relative_error
+        total = layer_loss if total is None else total + layer_loss
+        num_layers += 1
+
+        if collect_metrics:
+            with torch.no_grad():
+                meaningful = pre > float(meaningful_threshold)
+                meaningful_count = meaningful.sum()
+                jsd_sum += float(jsd.detach())
+                mass_error_sum += float(relative_mass_error.detach())
+                zero_meaningful_sum += float(((post == 0) & meaningful).sum())
+                meaningful_sum += float(meaningful_count)
+                post_zero_sum += float((post == 0).sum())
+                element_sum += float(post.numel())
+                topk_error_sum += float(topk_relative_error.detach())
+                topk_retention_sum += float(
+                    (post_topk_mass / pre_topk_mass.clamp_min(1e-6)).mean().detach()
+                )
+
+    if total is None or num_layers == 0:
+        raise ValueError("attention_quantization_fidelity_loss found no valid attention tensors")
+
+    metrics = {}
+    if collect_metrics:
+        metrics = {
+            "jsd": jsd_sum / num_layers,
+            "mass_error": mass_error_sum / num_layers,
+            "meaningful_zero_rate": zero_meaningful_sum / max(meaningful_sum, 1.0),
+            "post_zero_rate": post_zero_sum / max(element_sum, 1.0),
+            "topk_mass_error": topk_error_sum / num_layers,
+            "topk_mass_retention": topk_retention_sum / num_layers,
+            "layers": float(num_layers),
+        }
+    return total / num_layers, metrics
+
+
+def configure_attention_output_quant_capture(model: nn.Module, enabled: bool) -> int:
+    """Enable the pre/post-quant attention-context pair cached by Deit attention modules."""
+    configured = 0
+    for module in model.modules():
+        if hasattr(module, "capture_attn_quant_output"):
+            module.capture_attn_quant_output = bool(enabled)
+            module._last_attn_quant_output_pair = None
+            configured += 1
+    return configured
+
+
+def configure_attention_softmax_post_quant_renorm(model: nn.Module, enabled: bool) -> int:
+    """Renormalize each quantized attention row back to unit mass."""
+    configured = 0
+    for module in model.modules():
+        if not hasattr(module, "quan_a_softmax_fn"):
+            continue
+        module.attention_softmax_post_quant_renorm = bool(enabled)
+        configured += 1
+    return configured
+
+
+def configure_attention_softmax_fp_bypass(
+    model: nn.Module,
+    enabled: bool,
+    layers: Sequence[str] = (),
+) -> int:
+    """Bypass the post-softmax activation quantizer for an upper-bound diagnostic."""
+    configured = 0
+    wanted = tuple(str(name) for name in layers if str(name))
+    for name, module in model.named_modules():
+        if not hasattr(module, "quan_a_softmax_fn"):
+            continue
+        if wanted and not parameter_belongs_to_any_module(name, wanted):
+            continue
+        module.attention_softmax_fp = bool(enabled)
+        configured += 1
+    return configured
+
+
+def configure_activation_quant_fp_bypass(
+    model: nn.Module,
+    suffixes: Sequence[str],
+) -> int:
+    """Bypass selected activation LSQ quantizers for sensitivity diagnostics."""
+    wanted = tuple(str(suffix) for suffix in suffixes if str(suffix))
+    if not wanted:
+        raise ValueError("activation quant FP bypass requires at least one suffix")
+    configured = 0
+    for name, module in model.named_modules():
+        if not any(name == suffix or name.endswith(f".{suffix}") or name.endswith(suffix) for suffix in wanted):
+            continue
+        module.activation_quant_bypass = True
+        configured += 1
+    return configured
+
+
+def collect_attention_output_quant_pairs(model: nn.Module) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    for module in model.modules():
+        pair = getattr(module, "_last_attn_quant_output_pair", None)
+        if isinstance(pair, (tuple, list)) and len(pair) == 2:
+            pre, post = pair
+            if torch.is_tensor(pre) and torch.is_tensor(post):
+                pairs.append((pre, post))
+    return pairs
+
+
+def attention_output_quantization_fidelity_loss(
+    pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+) -> torch.Tensor:
+    """Preserve the direction of attention-weighted values after probability quantization."""
+    if not pairs:
+        raise ValueError("attention_output_quantization_fidelity_loss received no capture pairs")
+    total = None
+    for pre, post in pairs:
+        pre = pre.float().detach()
+        post = post.float()
+        cosine = F.cosine_similarity(post, pre, dim=-1)
+        layer_loss = (1.0 - cosine).mean()
+        total = layer_loss if total is None else total + layer_loss
+    return total / len(pairs)
+
+
 def set_selected_attention_heads(model: nn.Module, head_map: Optional[Dict[int, Sequence[int]]] = None) -> None:
     if head_map is None:
         for module in model.modules():
@@ -3286,7 +3593,32 @@ def matches_quant_slow_state_policy(name: str, policy: str) -> bool:
         return is_quant_or_shift_parameter(name)
     if policy == "activation":
         return is_activation_quant_or_shift_parameter(name)
+    if policy == "attention_softmax":
+        return name.endswith("quan_a_softmax_fn.s")
     raise ValueError(f"Unsupported quant slow state policy: {policy}")
+
+
+def project_lsq_scale_floors(model: nn.Module, floor: float, target: str) -> int:
+    """Keep LSQ scale parameters in the active positive-gradient region."""
+    floor = float(floor)
+    if floor <= 0:
+        return 0
+    updated = 0
+    for name, param in maybe_unwrap_ddp(model).named_parameters():
+        if not name.endswith(".s"):
+            continue
+        if target == "attention_softmax":
+            selected = name.endswith("quan_a_softmax_fn.s")
+        elif target == "activation":
+            selected = is_activation_quant_or_shift_parameter(name)
+        else:
+            raise ValueError(f"Unsupported lsq scale floor target: {target}")
+        if not selected:
+            continue
+        with torch.no_grad():
+            param.data.clamp_min_(floor)
+        updated += 1
+    return updated
 
 
 def collect_activation_scale_anchor_state(model: nn.Module, module_names: Sequence[str]) -> Dict[str, torch.Tensor]:
@@ -4287,6 +4619,7 @@ def set_aoq_explore_scale_ratio(
     scale_ratio: float,
     selective_margin: float = 0.0,
     threshold_ratio: float = 0.0,
+    include_attention_softmax: bool = False,
 ) -> int:
     root = maybe_unwrap_ddp(model)
     wanted = tuple(str(name) for name in module_names if str(name))
@@ -4297,7 +4630,10 @@ def set_aoq_explore_scale_ratio(
     for module_name, module in root.named_modules():
         if wanted and not parameter_belongs_to_any_module(module_name, wanted):
             continue
-        for attr in ("statsq_fn", "qk_quant", "v_quant", "lsqw_fn"):
+        quantizer_attrs = ["statsq_fn", "qk_quant", "v_quant", "lsqw_fn"]
+        if include_attention_softmax:
+            quantizer_attrs.append("quan_a_softmax_fn")
+        for attr in quantizer_attrs:
             quantizer = getattr(module, attr, None)
             if quantizer is not None and hasattr(quantizer, "aoq_scale_ratio"):
                 quantizer.aoq_scale_ratio = ratio
@@ -6192,6 +6528,11 @@ def validate_ofq(model: nn.Module, loader, loss_fn, runtime_args: SimpleNamespac
     local_top1_correct = 0.0
     local_top5_correct = 0.0
     local_samples = 0.0
+    attention_quant_captures = []
+    attention_quant_handles = []
+    if runtime_args.attention_quant_weight > 0 and runtime_args.local_rank == 0:
+        attention_quant_captures, attention_quant_handles = install_attention_quantization_hooks(model)
+    logged_validation_attention_quant = False
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(loader):
             last_batch = batch_idx == last_idx
@@ -6202,6 +6543,36 @@ def validate_ofq(model: nn.Module, loader, loss_fn, runtime_args: SimpleNamespac
                 input = input.contiguous(memory_format=torch.channels_last)
             with amp_autocast():
                 output = model(input)
+            if (
+                runtime_args.local_rank == 0
+                and runtime_args.attention_quant_weight > 0
+                and not logged_validation_attention_quant
+                and attention_quant_captures
+            ):
+                _quant_loss, quant_metrics = attention_quantization_fidelity_loss(
+                    attention_quant_captures,
+                    jsd_weight=runtime_args.attention_quant_jsd_weight,
+                    mass_weight=runtime_args.attention_quant_mass_weight,
+                    topk_mass_weight=runtime_args.attention_quant_topk_mass_weight,
+                    topk=runtime_args.attention_quant_topk,
+                    collect_metrics=True,
+                )
+                print(
+                    "Validation attention quant diagnostics: "
+                    f"loss={float(_quant_loss.detach()):.6f}, "
+                    f"jsd={quant_metrics['jsd']:.6f}, "
+                    f"mass_error={quant_metrics['mass_error']:.6f}, "
+                    f"meaningful_zero_rate={quant_metrics['meaningful_zero_rate']:.6f}, "
+                    f"post_zero_rate={quant_metrics['post_zero_rate']:.6f}, "
+                    f"topk_mass_error={quant_metrics['topk_mass_error']:.6f}, "
+                    f"topk_mass_retention={quant_metrics['topk_mass_retention']:.6f}, "
+                    f"layers={quant_metrics['layers']:.0f}"
+                )
+                logged_validation_attention_quant = True
+                attention_quant_captures.clear()
+                for handle in attention_quant_handles:
+                    handle.remove()
+                attention_quant_handles.clear()
             if isinstance(output, (tuple, list)):
                 output = output[0]
             reduce_factor = runtime_args.tta
@@ -6228,6 +6599,8 @@ def validate_ofq(model: nn.Module, loader, loss_fn, runtime_args: SimpleNamespac
                     f"Loss: {local_loss:>7.4f}  Acc@1: {local_top1:>7.4f}  "
                     f"Acc@5: {local_top5:>7.4f}  Samples: {int(local_samples)}"
                 )
+    for handle in attention_quant_handles:
+        handle.remove()
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -6294,7 +6667,9 @@ def compute_ofq_batch_loss(input, target, model: nn.Module, loss_fn, runtime_arg
             else:
                 teacher_logit = teacher_output
                 teacher_attn_info = None
-            if runtime_args.model_type == "deit":
+            if runtime_args.model_type == "deit" and not (
+                runtime_args.kd_hard_and_soft == 1 and runtime_args.ofq_official_kd_heads
+            ):
                 student_logit = collapse_deit_distilled_logits(student_logit)
             if runtime_args.teacher_type == "deit":
                 teacher_logit = collapse_deit_distilled_logits(teacher_logit)
@@ -6395,6 +6770,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     teacher_attn_kl_losses_m = AverageMeter()
     teacher_qk_rel_losses_m = AverageMeter()
     attn_rank_losses_m = AverageMeter()
+    attention_quant_losses_m = AverageMeter()
+    attention_output_losses_m = AverageMeter()
     logit_rank_losses_m = AverageMeter()
     teacher_attn_output_losses_m = AverageMeter()
     teacher_feature_output_losses_m = AverageMeter()
@@ -6420,6 +6797,10 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
     logged_teacher_attn_kl_debug = False
     logged_attn_rank_debug = False
     logged_attn_rank_probe = False
+    logged_attention_quant_debug = False
+    logged_attention_quant_probe = False
+    logged_attention_output_debug = False
+    logged_attention_output_probe = False
     logged_logit_rank_debug = False
     logged_logit_rank_probe = False
     attn_rank_loss_fn = (
@@ -6512,7 +6893,16 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 or was_active
             )
             aoq_pairs = (
-                set_aoq_explore_scale_ratio(model, aoq_explore_layers, ratio, selective_margin, active_threshold_ratio)
+                set_aoq_explore_scale_ratio(
+                    model,
+                    aoq_explore_layers,
+                    ratio,
+                    selective_margin,
+                    active_threshold_ratio,
+                    include_attention_softmax=bool(
+                        getattr(runtime_args, "aoq_explore_attention_softmax", False)
+                    ),
+                )
                 if apply_base_ratio
                 else 0
             )
@@ -6610,6 +7000,9 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 teacher_feature_outputs = []
                 act_bin_margin_captures = []
                 act_bin_margin_handles = []
+                attention_quant_captures = []
+                attention_quant_handles = []
+                attention_output_pairs = []
                 capture_teacher_attn_output = (
                     teacher is not None
                     and epoch >= runtime_args.teacher_attn_output_warmup_epochs
@@ -6628,6 +7021,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                         quantizer_names=act_bin_margin_quantizers,
                         detach=False,
                     )
+                if runtime_args.attention_quant_weight > 0:
+                    attention_quant_captures, attention_quant_handles = install_attention_quantization_hooks(model)
                 try:
                     if runtime_args.model_type in {"deit", "swin"}:
                         if capture_teacher_attn_output and capture_teacher_feature_output:
@@ -6654,8 +7049,12 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                     else:
                         student_logit = model(input)
                         student_attn_info = None
+                    if runtime_args.attention_output_weight > 0:
+                        attention_output_pairs = collect_attention_output_quant_pairs(model)
                 finally:
                     for handle in act_bin_margin_handles:
+                        handle.remove()
+                    for handle in attention_quant_handles:
                         handle.remove()
 
                 teacher_attn_info = None
@@ -6687,7 +7086,9 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                     else:
                         teacher_logit = teacher_output
                         teacher_attn_info = None
-                    if runtime_args.model_type == "deit":
+                    if runtime_args.model_type == "deit" and not (
+                        runtime_args.kd_hard_and_soft == 1 and runtime_args.ofq_official_kd_heads
+                    ):
                         student_logit = collapse_deit_distilled_logits(student_logit)
                     if runtime_args.teacher_type == "deit":
                         teacher_logit = collapse_deit_distilled_logits(teacher_logit)
@@ -6772,6 +7173,9 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 teacher_attn_kl_loss = loss.new_zeros(())
                 teacher_qk_rel_loss = loss.new_zeros(())
                 attn_rank_loss = loss.new_zeros(())
+                attention_quant_loss = loss.new_zeros(())
+                attention_quant_metrics = {}
+                attention_output_loss = loss.new_zeros(())
                 attn_rank_pairs = 0
                 logit_rank_loss = loss.new_zeros(())
                 logit_rank_pairs = 0
@@ -6783,6 +7187,106 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 bin_reg_loss = loss.new_zeros(())
                 selective_bin_anchor_loss_value = loss.new_zeros(())
                 act_bin_margin_loss_value = loss.new_zeros(())
+                if runtime_args.attention_quant_weight > 0:
+                    attention_quant_loss, attention_quant_metrics = attention_quantization_fidelity_loss(
+                        attention_quant_captures,
+                        jsd_weight=runtime_args.attention_quant_jsd_weight,
+                        mass_weight=runtime_args.attention_quant_mass_weight,
+                        topk_mass_weight=runtime_args.attention_quant_topk_mass_weight,
+                        topk=runtime_args.attention_quant_topk,
+                        collect_metrics=runtime_args.local_rank == 0 and not logged_attention_quant_debug,
+                    )
+                    if runtime_args.attention_quant_probe and not logged_attention_quant_probe:
+                        try:
+                            probe_params = [p for p in model.parameters() if p.requires_grad]
+                            g_base = torch.autograd.grad(loss, probe_params, retain_graph=True, allow_unused=True)
+                            g_quant = torch.autograd.grad(attention_quant_loss, probe_params, retain_graph=True, allow_unused=True)
+
+                            def _quant_probe_norm(grads):
+                                total_norm = 0.0
+                                touched = 0
+                                for grad in grads:
+                                    if grad is None:
+                                        continue
+                                    touched += 1
+                                    total_norm += float(grad.detach().float().pow(2).sum())
+                                return total_norm ** 0.5, touched
+
+                            n_base, p_base = _quant_probe_norm(g_base)
+                            n_quant, p_quant = _quant_probe_norm(g_quant)
+                            print(
+                                "AttentionQuant grad probe: "
+                                f"||dBase/dtheta||={n_base:.4e} ({p_base} tensors) "
+                                f"||dQuant/dtheta||={n_quant:.4e} ({p_quant} tensors) "
+                                f"ratio={n_base / max(n_quant, 1e-12):.4f} | "
+                                f"lambda(rho=0.01)={0.01 * n_base / max(n_quant, 1e-12):.4g} "
+                                f"lambda(rho=0.03)={0.03 * n_base / max(n_quant, 1e-12):.4g} "
+                                f"lambda(rho=0.1)={0.1 * n_base / max(n_quant, 1e-12):.4g} "
+                                f"local_rank={runtime_args.local_rank}"
+                            )
+                        except RuntimeError as exc:
+                            print(f"AttentionQuant grad probe failed: {exc}")
+                        logged_attention_quant_probe = True
+                    loss = loss + runtime_args.attention_quant_weight * attention_quant_loss
+                    if runtime_args.local_rank == 0 and not logged_attention_quant_debug:
+                        print(
+                            "Attention quantization fidelity debug: "
+                            f"weight={runtime_args.attention_quant_weight}, "
+                            f"jsd_weight={runtime_args.attention_quant_jsd_weight}, "
+                            f"mass_weight={runtime_args.attention_quant_mass_weight}, "
+                            f"topk_mass_weight={runtime_args.attention_quant_topk_mass_weight}, "
+                            f"topk={runtime_args.attention_quant_topk}, "
+                            f"layers={attention_quant_metrics.get('layers', 0.0):.0f}, "
+                            f"jsd={attention_quant_metrics.get('jsd', 0.0):.6f}, "
+                            f"mass_error={attention_quant_metrics.get('mass_error', 0.0):.6f}, "
+                            f"meaningful_zero_rate={attention_quant_metrics.get('meaningful_zero_rate', 0.0):.6f}, "
+                            f"post_zero_rate={attention_quant_metrics.get('post_zero_rate', 0.0):.6f}, "
+                            f"topk_mass_error={attention_quant_metrics.get('topk_mass_error', 0.0):.6f}, "
+                            f"topk_mass_retention={attention_quant_metrics.get('topk_mass_retention', 0.0):.6f}"
+                        )
+                        logged_attention_quant_debug = True
+                if runtime_args.attention_output_weight > 0:
+                    attention_output_loss = attention_output_quantization_fidelity_loss(attention_output_pairs)
+                    if runtime_args.attention_output_probe and not logged_attention_output_probe:
+                        try:
+                            probe_params = [p for p in model.parameters() if p.requires_grad]
+                            g_base = torch.autograd.grad(loss, probe_params, retain_graph=True, allow_unused=True)
+                            g_output = torch.autograd.grad(attention_output_loss, probe_params, retain_graph=True, allow_unused=True)
+
+                            def _output_probe_norm(grads):
+                                total_norm = 0.0
+                                touched = 0
+                                for grad in grads:
+                                    if grad is None:
+                                        continue
+                                    touched += 1
+                                    total_norm += float(grad.detach().float().pow(2).sum())
+                                return total_norm ** 0.5, touched
+
+                            n_base, p_base = _output_probe_norm(g_base)
+                            n_output, p_output = _output_probe_norm(g_output)
+                            print(
+                                "AttentionOutput grad probe: "
+                                f"||dBase/dtheta||={n_base:.4e} ({p_base} tensors) "
+                                f"||dOutput/dtheta||={n_output:.4e} ({p_output} tensors) "
+                                f"ratio={n_base / max(n_output, 1e-12):.4f} | "
+                                f"lambda(rho=0.01)={0.01 * n_base / max(n_output, 1e-12):.4g} "
+                                f"lambda(rho=0.03)={0.03 * n_base / max(n_output, 1e-12):.4g} "
+                                f"lambda(rho=0.1)={0.1 * n_base / max(n_output, 1e-12):.4g} "
+                                f"local_rank={runtime_args.local_rank}"
+                            )
+                        except RuntimeError as exc:
+                            print(f"AttentionOutput grad probe failed: {exc}")
+                        logged_attention_output_probe = True
+                    loss = loss + runtime_args.attention_output_weight * attention_output_loss
+                    if runtime_args.local_rank == 0 and not logged_attention_output_debug:
+                        print(
+                            "Attention output quantization fidelity debug: "
+                            f"weight={runtime_args.attention_output_weight}, "
+                            f"pairs={len(attention_output_pairs)}, "
+                            f"loss={float(attention_output_loss.detach()):.6f}"
+                        )
+                        logged_attention_output_debug = True
                 current_ref_attn_kl_weight = ref_attn_kl_weight
                 current_ref_logit_kl_weight = runtime_args.ref_logit_kl_weight
                 if runtime_args.ref_stop_updates > 0 and local_update_count >= runtime_args.ref_stop_updates:
@@ -7200,6 +7704,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
             teacher_attn_kl_loss_for_log = teacher_attn_kl_loss.detach()
             teacher_qk_rel_loss_for_log = teacher_qk_rel_loss.detach()
             attn_rank_loss_for_log = attn_rank_loss.detach()
+            attention_quant_loss_for_log = attention_quant_loss.detach()
+            attention_output_loss_for_log = attention_output_loss.detach()
             logit_rank_loss_for_log = logit_rank_loss.detach()
             teacher_attn_output_loss_for_log = teacher_attn_output_loss.detach()
             teacher_feature_output_loss_for_log = teacher_feature_output_loss.detach()
@@ -7218,6 +7724,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 teacher_attn_kl_losses_m.update(teacher_attn_kl_loss_for_log.item(), input.size(0))
                 teacher_qk_rel_losses_m.update(teacher_qk_rel_loss_for_log.item(), input.size(0))
                 attn_rank_losses_m.update(attn_rank_loss_for_log.item(), input.size(0))
+                attention_quant_losses_m.update(attention_quant_loss_for_log.item(), input.size(0))
+                attention_output_losses_m.update(attention_output_loss_for_log.item(), input.size(0))
                 logit_rank_losses_m.update(logit_rank_loss_for_log.item(), input.size(0))
                 teacher_attn_output_losses_m.update(teacher_attn_output_loss_for_log.item(), input.size(0))
                 teacher_feature_output_losses_m.update(teacher_feature_output_loss_for_log.item(), input.size(0))
@@ -7295,6 +7803,11 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
 
         if update_step:
             optimizer.zero_grad(set_to_none=True)
+            project_lsq_scale_floors(
+                model,
+                runtime_args.lsq_scale_floor,
+                runtime_args.lsq_scale_floor_target,
+            )
             local_update_count += 1
             runtime_args._global_train_update += 1
             if epoch >= int(getattr(runtime_args, "quant_slow_state_observe_start_epoch", 0)):
@@ -7352,6 +7865,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 reduced_teacher_attn_kl_loss = reduce_tensor(teacher_attn_kl_loss_for_log, runtime_args.world_size)
                 reduced_teacher_qk_rel_loss = reduce_tensor(teacher_qk_rel_loss_for_log, runtime_args.world_size)
                 reduced_attn_rank_loss = reduce_tensor(attn_rank_loss_for_log, runtime_args.world_size)
+                reduced_attention_quant_loss = reduce_tensor(attention_quant_loss_for_log, runtime_args.world_size)
+                reduced_attention_output_loss = reduce_tensor(attention_output_loss_for_log, runtime_args.world_size)
                 reduced_logit_rank_loss = reduce_tensor(logit_rank_loss_for_log, runtime_args.world_size)
                 reduced_teacher_attn_output_loss = reduce_tensor(teacher_attn_output_loss_for_log, runtime_args.world_size)
                 reduced_teacher_feature_output_loss = reduce_tensor(teacher_feature_output_loss_for_log, runtime_args.world_size)
@@ -7369,6 +7884,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 teacher_attn_kl_losses_m.update(reduced_teacher_attn_kl_loss.item(), input.size(0))
                 teacher_qk_rel_losses_m.update(reduced_teacher_qk_rel_loss.item(), input.size(0))
                 attn_rank_losses_m.update(reduced_attn_rank_loss.item(), input.size(0))
+                attention_quant_losses_m.update(reduced_attention_quant_loss.item(), input.size(0))
+                attention_output_losses_m.update(reduced_attention_output_loss.item(), input.size(0))
                 logit_rank_losses_m.update(reduced_logit_rank_loss.item(), input.size(0))
                 teacher_attn_output_losses_m.update(reduced_teacher_attn_output_loss.item(), input.size(0))
                 teacher_feature_output_losses_m.update(reduced_teacher_feature_output_loss.item(), input.size(0))
@@ -7389,6 +7906,8 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                     f"TeacherAttnKL: {teacher_attn_kl_losses_m.val:.3e} ({teacher_attn_kl_losses_m.avg:.3e})  "
                     f"TeacherRel: {teacher_qk_rel_losses_m.val:.3e} ({teacher_qk_rel_losses_m.avg:.3e})  "
                     f"AttnRank: {attn_rank_losses_m.val:.3e} ({attn_rank_losses_m.avg:.3e})  "
+                    f"AttnQuant: {attention_quant_losses_m.val:.3e} ({attention_quant_losses_m.avg:.3e})  "
+                    f"AttnOut: {attention_output_losses_m.val:.3e} ({attention_output_losses_m.avg:.3e})  "
                     f"LogitRank: {logit_rank_losses_m.val:.3e} ({logit_rank_losses_m.avg:.3e})  "
                     f"TeacherAttnOut: {teacher_attn_output_losses_m.val:.3e} ({teacher_attn_output_losses_m.avg:.3e})  "
                     f"TeacherFeatOut: {teacher_feature_output_losses_m.val:.3e} ({teacher_feature_output_losses_m.avg:.3e})  "
@@ -7445,6 +7964,36 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
 
     if runtime_args.quantized:
         model = get_ofq_qat_model(model, runtime_args)
+    if runtime_args.attention_softmax_post_quant_renorm:
+        configured = configure_attention_softmax_post_quant_renorm(model, True)
+        if runtime_args.local_rank == 0:
+            print(
+                "Enabled post-quant attention row-mass renormalization: "
+                f"modules={configured}"
+            )
+    if runtime_args.attention_softmax_fp:
+        fp_layers = parse_name_list(runtime_args.attention_softmax_fp_layers)
+        configured = configure_attention_softmax_fp_bypass(model, True, fp_layers)
+        if runtime_args.local_rank == 0:
+            print(
+                "Enabled post-softmax attention FP bypass diagnostic: "
+                f"modules={configured}, layers={fp_layers}"
+            )
+    if runtime_args.activation_quant_fp:
+        fp_suffixes = parse_name_list(runtime_args.activation_quant_fp_suffixes)
+        configured = configure_activation_quant_fp_bypass(model, fp_suffixes)
+        if runtime_args.local_rank == 0:
+            print(
+                "Enabled activation quantizer FP bypass diagnostic: "
+                f"modules={configured}, suffixes={fp_suffixes}"
+            )
+    if runtime_args.attention_output_weight > 0:
+        configured = configure_attention_output_quant_capture(model, True)
+        if runtime_args.local_rank == 0:
+            print(
+                "Enabled attention-output quantization fidelity capture: "
+                f"weight={runtime_args.attention_output_weight}, modules={configured}"
+            )
     if runtime_args.collect_attention:
         enabled_modules = enable_attention_collection(model)
         if runtime_args.local_rank == 0:
@@ -7562,6 +8111,17 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                 model_ema=None,
                 restore_rng=False,
                 log_info=runtime_args.local_rank == 0,
+            )
+        floor_updated = project_lsq_scale_floors(
+            model,
+            runtime_args.lsq_scale_floor,
+            runtime_args.lsq_scale_floor_target,
+        )
+        if floor_updated and runtime_args.local_rank == 0:
+            print(
+                "Applied LSQ scale floor before eval: "
+                f"tensors={floor_updated}, floor={runtime_args.lsq_scale_floor}, "
+                f"target={runtime_args.lsq_scale_floor_target}"
             )
         dataset_eval = create_dataset_compat(
             runtime_args.dataset,
@@ -7763,6 +8323,17 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                         param_group["initial_lr"] = runtime_args.lr
                 if runtime_args.local_rank == 0:
                     print(f"Strict resume: forced restored optimizer lr to {runtime_args.lr}")
+        floor_updated = project_lsq_scale_floors(
+            model,
+            runtime_args.lsq_scale_floor,
+            runtime_args.lsq_scale_floor_target,
+        )
+        if floor_updated and runtime_args.local_rank == 0:
+            print(
+                "Applied LSQ scale floor after resume: "
+                f"tensors={floor_updated}, floor={runtime_args.lsq_scale_floor}, "
+                f"target={runtime_args.lsq_scale_floor_target}"
+            )
         post_resume_setup_batches = max(0, int(getattr(runtime_args, "post_resume_setup_alpha_batches", 0)))
         if post_resume_setup_batches > 0:
             original_setup_batches = runtime_args.setup_alpha_batches
@@ -8573,6 +9144,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aq-clip-learnable", dest="aq_clip_learnable", action="store_true")
     parser.add_argument("--use-kd", dest="use_kd", action="store_true")
     parser.add_argument("--kd-hard-and-soft", dest="kd_hard_and_soft", type=int)
+    parser.add_argument(
+        "--ofq-official-kd-heads",
+        dest="ofq_official_kd_heads",
+        action="store_true",
+        help="use official OFQ DeiT head routing: CE(cls, GT) + KL(dist, teacher)",
+    )
     parser.add_argument("--teacher-pretrained", dest="teacher_pretrained", action="store_true")
     parser.add_argument("--teacher-checkpoint", dest="teacher_checkpoint", type=str)
     parser.add_argument("--quant-teacher", dest="quant_teacher", action="store_true", help="quantize teacher before loading teacher checkpoint")
@@ -8677,9 +9254,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quant-slow-state-decay", dest="quant_slow_state_decay", type=float, default=None, help="QSS quant/shift shadow EMA decay；0 关闭")
     parser.add_argument("--quant-slow-state-sync-interval", dest="quant_slow_state_sync_interval", type=int, default=None, help="QSS 每隔多少 optimizer updates 将 student quant/shift 拉向 shadow")
     parser.add_argument("--quant-slow-state-pull", dest="quant_slow_state_pull", type=float, default=None, help="QSS 同步时 shadow 注入比例")
-    parser.add_argument("--quant-slow-state-policy", dest="quant_slow_state_policy", choices=["all", "activation"], default=None, help="QSS 维护哪些 quant/shift 参数")
+    parser.add_argument("--quant-slow-state-policy", dest="quant_slow_state_policy", choices=["all", "activation", "attention_softmax"], default=None, help="QSS 维护哪些 quant/shift 参数")
     parser.add_argument("--quant-slow-state-observe-start-epoch", dest="quant_slow_state_observe_start_epoch", type=int, default=None, help="QSS 从第几个 epoch 开始维护 shadow EMA")
     parser.add_argument("--quant-slow-state-start-epoch", dest="quant_slow_state_start_epoch", type=int, default=None, help="QSS 从第几个 epoch 开始启用")
+    parser.add_argument("--lsq-scale-floor", dest="lsq_scale_floor", type=float, default=None, help="optimizer step 后把选定的 LSQ alpha 投影到正值下界，避免 clamp 死区")
+    parser.add_argument("--lsq-scale-floor-target", dest="lsq_scale_floor_target", choices=["attention_softmax", "activation"], default=None, help="LSQ scale floor 作用范围")
     parser.add_argument("--act-scale-anchor-weight", dest="act_scale_anchor_weight", type=float, default=None, help="activation LSQ scale anchor regularizer weight; 0 disables")
     parser.add_argument("--act-scale-anchor-layers", dest="act_scale_anchor_layers", type=str, default=None, help="activation scale anchor 作用的 named module 列表；空表示全部 activation quantizers")
     parser.add_argument("--act-scale-anchor-start-epoch", dest="act_scale_anchor_start_epoch", type=int, default=None, help="从第几个 epoch 开始启用 activation scale anchor")
@@ -8695,6 +9274,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--variation-trust-start-update", dest="variation_trust_start_update", type=int, default=None, help="延迟到第几个 local optimizer update 捕获 variation trust anchor；0 表示训练开始前捕获")
     parser.add_argument("--aoq-explore-scale-ratio", dest="aoq_explore_scale_ratio", type=float, default=None, help="AOQ-inspired 探索阶段对 selected weight quantizer scale 的临时倍率；1 关闭，<1 缩窄 threshold/level 间隔")
     parser.add_argument("--aoq-explore-threshold-ratio", dest="aoq_explore_threshold_ratio", type=float, default=None, help="AOQ-inspired 探索阶段仅对 threshold interval 的临时倍率；0 表示跟随 scale ratio")
+    parser.add_argument("--aoq-explore-attention-softmax", dest="aoq_explore_attention_softmax", action="store_true", help="把 AOQ threshold/level 探索同时作用于 post-softmax activation quantizer")
     parser.add_argument("--aoq-explore-layers", dest="aoq_explore_layers", type=str, default=None, help="AOQ explore 只作用于这些 named module；空表示全部 StatsQ/qk/v/LSQ weight quantizers")
     parser.add_argument("--aoq-explore-layer-ratios", dest="aoq_explore_layer_ratios", type=str, default=None, help="AOQ explore 按 named module 覆盖 scale ratio，格式 module:ratio,module:ratio；覆盖会在基础 ratio 之后应用")
     parser.add_argument("--aoq-explore-selective-margin", dest="aoq_explore_selective_margin", type=float, default=None, help="AOQ explore 只对距离 weight bin boundary 不超过该 margin 的元素应用 scale ratio；0 表示全量应用")

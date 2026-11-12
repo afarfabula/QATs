@@ -625,6 +625,8 @@ class LsqQuantizer(torch.nn.Module):
         self.initialized_alpha = True
         
     def forward(self, x):
+        if bool(getattr(self, "activation_quant_bypass", False)):
+            return x
         if self.per_channel:
             if (not self.initialized_alpha):
                 self.init_from(x)
@@ -829,6 +831,8 @@ class LsqQuantizer4v(torch.nn.Module):
         self.initialized_alpha = True
         
     def forward(self, x):
+        if bool(getattr(self, "activation_quant_bypass", False)):
+            return x
         if self.per_channel:
             if (not self.initialized_alpha):
                 self.init_from(x)
