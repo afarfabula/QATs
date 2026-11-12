@@ -147,8 +147,12 @@ class StatsQuantizer(nn.Module):
             self.s = scaling_factor.squeeze()
             scaled_weights = real_weights.detach() / scaling_factor
             cliped_weights = scaled_weights.clamp(-1.0, 1.0 - 1e-6)
-            n = float(2 ** (self.num_bits - 1))
-            quan_weights_no_grad = scaling_factor * ((torch.round(cliped_weights * n - 0.5) + 0.5) / n)
+            if int(self.num_bits) == 0:
+                # Ternary levels {-1, 0, 1}; bit=0 is an internal sentinel.
+                quan_weights_no_grad = scaling_factor * torch.round(cliped_weights)
+            else:
+                n = float(2 ** (self.num_bits - 1))
+                quan_weights_no_grad = scaling_factor * ((torch.round(cliped_weights * n - 0.5) + 0.5) / n)
         quan_weights = quan_weights_no_grad - real_weights.detach() + real_weights
 
         return quan_weights

@@ -22,7 +22,10 @@ class LsqQuantizerWeight(torch.nn.Module):
         super(LsqQuantizerWeight, self).__init__()
 
         if all_positive:
-            if bit == 1:
+            if bit == 0:
+                self.thd_neg = 0
+                self.thd_pos = 2
+            elif bit == 1:
                 self.thd_neg = 0
                 self.thd_pos = 1
             else:
@@ -30,7 +33,10 @@ class LsqQuantizerWeight(torch.nn.Module):
                 self.thd_neg = 0
                 self.thd_pos = 2 ** bit - 1
         else:
-            if bit == 1:
+            if bit == 0:
+                self.thd_neg = -1
+                self.thd_pos = 1
+            elif bit == 1:
                 self.thd_neg = -1
                 self.thd_pos = 1
             else:
@@ -120,7 +126,10 @@ class LsqQuantizerWeight(torch.nn.Module):
             s_level = s_base * aoq_ratio
 
         x = x / s_threshold
-        if self.bit == 1 and not self.all_positive:
+        if self.bit == 0:
+            x = torch.clamp(x, self.thd_neg, self.thd_pos)
+            x = round_pass(x)
+        elif self.bit == 1 and not self.all_positive:
             x = torch.sign(x)
         else:
             x = torch.clamp(x, self.thd_neg, self.thd_pos)
@@ -573,7 +582,10 @@ class LsqQuantizer(torch.nn.Module):
         super(LsqQuantizer, self).__init__()
 
         if all_positive:
-            if bit == 1:
+            if bit == 0:
+                self.thd_neg = 0
+                self.thd_pos = 2
+            elif bit == 1:
                 self.thd_neg = 0
                 self.thd_pos = 1
             else:
@@ -581,7 +593,10 @@ class LsqQuantizer(torch.nn.Module):
                 self.thd_neg = 0
                 self.thd_pos = 2 ** bit - 1
         else:
-            if bit == 1:
+            if bit == 0:
+                self.thd_neg = -1
+                self.thd_pos = 1
+            elif bit == 1:
                 self.thd_neg = -1
                 self.thd_pos = 1
             else:
@@ -651,7 +666,10 @@ class LsqQuantizer(torch.nn.Module):
         s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
 
         x = x / s_scale
-        if self.bit == 1 and not self.all_positive:
+        if self.bit == 0:
+            x = torch.clamp(x, self.thd_neg, self.thd_pos)
+            x = round_pass(x)
+        elif self.bit == 1 and not self.all_positive:
             x = torch.sign(x)
         else:
             x = torch.clamp(x, self.thd_neg, self.thd_pos)
@@ -779,7 +797,10 @@ class LsqQuantizer4v(torch.nn.Module):
         super(LsqQuantizer4v, self).__init__()
 
         if all_positive:
-            if bit == 1:
+            if bit == 0:
+                self.thd_neg = 0
+                self.thd_pos = 2
+            elif bit == 1:
                 self.thd_neg = 0
                 self.thd_pos = 1
             else:
@@ -787,7 +808,10 @@ class LsqQuantizer4v(torch.nn.Module):
                 self.thd_neg = 0
                 self.thd_pos = 2 ** bit - 1
         else:
-            if bit == 1:
+            if bit == 0:
+                self.thd_neg = -1
+                self.thd_pos = 1
+            elif bit == 1:
                 self.thd_neg = -1
                 self.thd_pos = 1
             else:
@@ -861,7 +885,10 @@ class LsqQuantizer4v(torch.nn.Module):
         s_scale = grad_scale(clip(alpha, 1e-5), s_grad_scale)
 
         x = x / s_scale
-        if self.bit == 1 and not self.all_positive:
+        if self.bit == 0:
+            x = torch.clamp(x, self.thd_neg, self.thd_pos)
+            x = round_pass(x)
+        elif self.bit == 1 and not self.all_positive:
             x = torch.sign(x)
         else:
             x = torch.clamp(x, self.thd_neg, self.thd_pos)

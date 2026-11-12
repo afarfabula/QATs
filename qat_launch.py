@@ -14,6 +14,7 @@ import math
 import functools
 import os
 import random
+import re
 import shlex
 import sys
 import time
@@ -737,6 +738,9 @@ def build_ofq(args: argparse.Namespace) -> Tuple[List[str], Path, Dict[str, str]
     append_optional_value(command, "--dynamic-kl-controller-tsv", getattr(args, "dynamic_kl_controller_tsv", None))
     append_optional_value(command, "--dynamic-kl-prior-source", getattr(args, "dynamic_kl_prior_source", None))
     append_optional_value(command, "--epoch-lr-overrides", args.epoch_lr_overrides)
+    append_optional_value(command, "--depth-bit-profile", getattr(args, "depth_bit_profile", None))
+    append_optional_value(command, "--depth-weight-bit-profile", getattr(args, "depth_weight_bit_profile", None))
+    append_optional_value(command, "--depth-act-bit-profile", getattr(args, "depth_act_bit_profile", None))
     append_optional_value(command, "--progressive-bit-schedule", getattr(args, "progressive_bit_schedule", None))
     append_optional_flag(command, "--progressive-bit-rescale-lsq", getattr(args, "progressive_bit_rescale_lsq", False))
     append_optional_value(command, "--progressive-bit-recalibrate-epochs", getattr(args, "progressive_bit_recalibrate_epochs", None))
@@ -1112,6 +1116,9 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--dynamic-kl-controller-tsv", dest="dynamic_kl_controller_tsv", type=str)
     parser.add_argument("--dynamic-kl-prior-source", dest="dynamic_kl_prior_source", type=str)
     parser.add_argument("--epoch-lr-overrides", dest="epoch_lr_overrides", type=str)
+    parser.add_argument("--depth-bit-profile", dest="depth_bit_profile", type=str)
+    parser.add_argument("--depth-weight-bit-profile", dest="depth_weight_bit_profile", type=str)
+    parser.add_argument("--depth-act-bit-profile", dest="depth_act_bit_profile", type=str)
     parser.add_argument("--progressive-bit-schedule", dest="progressive_bit_schedule", type=str)
     parser.add_argument("--progressive-bit-rescale-lsq", dest="progressive_bit_rescale_lsq", action="store_true")
     parser.add_argument("--progressive-bit-recalibrate-epochs", dest="progressive_bit_recalibrate_epochs", type=str)
@@ -1218,6 +1225,65 @@ def parse_progressive_bit_schedule(spec: object) -> List[Tuple[int, int, int]]:
             raise ValueError(f"invalid progressive bit schedule item: {item!r}")
         schedule.append((epoch, wbits, abits))
     return sorted(schedule, key=lambda x: x[0])
+
+
+def parse_depth_bit_profile(spec: object) -> Tuple[int, ...]:
+    """Parse an ordered per-block profile; `T`/`ternary` is encoded as bit 0."""
+    if spec is None:
+        return ()
+    if isinstance(spec, (tuple, list)):
+        values = spec
+    else:
+        text = str(spec).strip()
+        if not text or text.lower() in {"none", "null", "off"}:
+            return ()
+        values = [item.strip() for item in text.split(",") if item.strip()]
+    ternary_tokens = {"t", "ternary", "1.58", "1.6"}
+    profile = tuple(
+        0 if str(item).strip().lower() in ternary_tokens else int(item)
+        for item in values
+    )
+    if any(bit < 0 or bit > 32 for bit in profile):
+        raise ValueError(f"depth bit profile entries must be ternary or in [1, 32], got {profile}")
+    return profile
+
+
+def format_depth_bit_profile(profile: Sequence[int]) -> str:
+    return ",".join("T" if int(bit) == 0 else str(int(bit)) for bit in profile)
+
+
+def mean_depth_profile_bits(profile: Sequence[int]) -> float:
+    if not profile:
+        return 0.0
+    ternary_bits = math.log2(3.0)
+    return sum(ternary_bits if int(bit) == 0 else float(bit) for bit in profile) / len(profile)
+
+
+def depth_profile_block_name(module_name: str) -> Optional[str]:
+    """Return the Transformer block owning an attn/mlp qmodule, if any."""
+    for suffix in (".attn", ".mlp"):
+        if module_name.endswith(suffix):
+            return module_name[: -len(suffix)]
+    return None
+
+
+def depth_profile_block_names(module_names: Sequence[str]) -> Tuple[str, ...]:
+    """Collect Transformer blocks in stable natural depth order."""
+    blocks = {
+        block
+        for name in module_names
+        if (block := depth_profile_block_name(name)) is not None
+    }
+
+    def natural_key(name: str) -> Tuple[Tuple[int, object], ...]:
+        key: List[Tuple[int, object]] = []
+        for token in re.split(r"(\d+)", name):
+            if not token:
+                continue
+            key.append((0, int(token)) if token.isdigit() else (1, token))
+        return tuple(key)
+
+    return tuple(sorted(blocks, key=natural_key))
 
 
 def progressive_bits_for_epoch(schedule: Sequence[Tuple[int, int, int]], epoch: int, default_wbits: int, default_abits: int) -> Tuple[int, int]:
@@ -1602,6 +1668,9 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "dynamic_kl_controller_tsv": "",
         "dynamic_kl_prior_source": "offline_attn_relation_oscillation_20260710",
         "epoch_lr_overrides": "",
+        "depth_bit_profile": "",
+        "depth_weight_bit_profile": "",
+        "depth_act_bit_profile": "",
         "progressive_bit_schedule": "",
         "progressive_bit_rescale_lsq": False,
         "progressive_bit_recalibrate_epochs": "",
@@ -2128,6 +2197,12 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["dynamic_kl_prior_source"] = args.dynamic_kl_prior_source
     if args.epoch_lr_overrides is not None:
         defaults["epoch_lr_overrides"] = args.epoch_lr_overrides
+    if getattr(args, "depth_bit_profile", None) is not None:
+        defaults["depth_bit_profile"] = args.depth_bit_profile
+    if getattr(args, "depth_weight_bit_profile", None) is not None:
+        defaults["depth_weight_bit_profile"] = args.depth_weight_bit_profile
+    if getattr(args, "depth_act_bit_profile", None) is not None:
+        defaults["depth_act_bit_profile"] = args.depth_act_bit_profile
     if getattr(args, "progressive_bit_schedule", None) is not None:
         defaults["progressive_bit_schedule"] = args.progressive_bit_schedule
     if getattr(args, "progressive_bit_rescale_lsq", False):
@@ -2576,7 +2651,18 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         if defaults["dynamic_kl_max_pulses_per_window"] < 0:
             raise ValueError("dynamic_kl_max_pulses_per_window must be non-negative")
     defaults["epoch_lr_overrides"] = parse_epoch_float_overrides(defaults.get("epoch_lr_overrides"))
+    depth_base_profile = parse_depth_bit_profile(defaults.get("depth_bit_profile"))
+    defaults["depth_weight_bit_profile"] = (
+        parse_depth_bit_profile(defaults.get("depth_weight_bit_profile")) or depth_base_profile
+    )
+    defaults["depth_act_bit_profile"] = (
+        parse_depth_bit_profile(defaults.get("depth_act_bit_profile")) or depth_base_profile
+    )
     defaults["progressive_bit_schedule"] = parse_progressive_bit_schedule(defaults.get("progressive_bit_schedule"))
+    if defaults["progressive_bit_schedule"] and (
+        defaults["depth_weight_bit_profile"] or defaults["depth_act_bit_profile"]
+    ):
+        raise ValueError("depth-wise bit profiles cannot be combined with progressive_bit_schedule")
     defaults["progressive_bit_rescale_lsq"] = bool(defaults.get("progressive_bit_rescale_lsq", False))
     defaults["progressive_bit_recalibrate_epochs"] = {
         int(item.strip()) for item in str(defaults.get("progressive_bit_recalibrate_epochs") or "").split(",") if item.strip()
@@ -2653,10 +2739,24 @@ def build_ofq_qconfigs(runtime_args: SimpleNamespace) -> Dict[str, Dict[str, obj
         "None": "None",
     }
     qconfigs: Dict[str, Dict[str, object]] = {}
+    block_names = depth_profile_block_names(runtime_args.qmodules)
+    weight_profile = tuple(getattr(runtime_args, "depth_weight_bit_profile", ()) or ())
+    act_profile = tuple(getattr(runtime_args, "depth_act_bit_profile", ()) or ())
+    for label, profile in (("weight", weight_profile), ("activation", act_profile)):
+        if profile and len(profile) != len(block_names):
+            raise ValueError(
+                f"depth {label} bit profile has {len(profile)} entries but model has "
+                f"{len(block_names)} Transformer blocks: {block_names}"
+            )
+    weight_bits_by_block = dict(zip(block_names, weight_profile)) if weight_profile else {}
+    act_bits_by_block = dict(zip(block_names, act_profile)) if act_profile else {}
     for module_name in runtime_args.qmodules:
+        block_name = depth_profile_block_name(module_name)
+        module_wbits = int(weight_bits_by_block.get(block_name, runtime_args.wq_bitw))
+        module_abits = int(act_bits_by_block.get(block_name, runtime_args.aq_bitw))
         wcfg = {
             "mode": runtime_args.wq_mode if runtime_args.wq_enable else "Identity",
-            "bit": runtime_args.wq_bitw if runtime_args.wq_bitw < 32 and runtime_args.aq_enable else "identity",
+            "bit": module_wbits if module_wbits < 32 and runtime_args.aq_enable else "identity",
             "all_positive": False,
             "symmetric": not runtime_args.wq_asym,
             "per_channel": runtime_args.wq_per_channel,
@@ -2665,8 +2765,8 @@ def build_ofq_qconfigs(runtime_args: SimpleNamespace) -> Dict[str, Dict[str, obj
         }
         acfg = {
             "enable": runtime_args.aq_enable if runtime_args.aq_enable else "Identity",
-            "mode": runtime_args.aq_mode if runtime_args.aq_bitw < 32 and runtime_args.aq_enable else "identity",
-            "bit": runtime_args.aq_bitw,
+            "mode": runtime_args.aq_mode if module_abits < 32 and runtime_args.aq_enable else "identity",
+            "bit": module_abits,
             "per_channel": runtime_args.aq_per_channel,
             "normalize_first": False,
             "learnable": runtime_args.aq_clip_learnable,
@@ -2683,6 +2783,18 @@ def build_ofq_qconfigs(runtime_args: SimpleNamespace) -> Dict[str, Dict[str, obj
 def get_ofq_qat_model(model: nn.Module, runtime_args: SimpleNamespace) -> nn.Module:
     helpers = load_ofq_training_module()
     qconfigs = build_ofq_qconfigs(runtime_args)
+    weight_profile = tuple(getattr(runtime_args, "depth_weight_bit_profile", ()) or ())
+    act_profile = tuple(getattr(runtime_args, "depth_act_bit_profile", ()) or ())
+    if (weight_profile or act_profile) and getattr(runtime_args, "local_rank", 0) == 0:
+        blocks = depth_profile_block_names(runtime_args.qmodules)
+        print(
+            "Depth-wise QAT bit profile: "
+            f"blocks={len(blocks)}, "
+            f"weight={format_depth_bit_profile(weight_profile) if weight_profile else 'uniform'}, "
+            f"activation={format_depth_bit_profile(act_profile) if act_profile else 'uniform'}, "
+            f"effective_mean_bits=weight:{mean_depth_profile_bits(weight_profile):.4f},"
+            f"activation:{mean_depth_profile_bits(act_profile):.4f}"
+        )
     if runtime_args.model_type == "deit":
         return helpers.replace_module_by_qmodule_deit(
             model,
@@ -5071,6 +5183,8 @@ def update_quant_slow_state(model: nn.Module, runtime_args: SimpleNamespace, glo
 
 def quant_thresholds(bit: int, all_positive: bool = False) -> Tuple[int, int]:
     bit = int(bit)
+    if bit == 0:
+        return (0, 2) if all_positive else (-1, 1)
     if all_positive:
         if bit == 1:
             return 0, 1
@@ -9138,6 +9252,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-type", dest="teacher_type", type=str, choices=["deit", "swin"], help="OFQ teacher_type")
     parser.add_argument("--wq-mode", dest="wq_mode", type=str, default="statsq")
     parser.add_argument("--aq-mode", dest="aq_mode", type=str, default="lsq")
+    parser.add_argument("--depth-bit-profile", dest="depth_bit_profile", type=str, help="按 Transformer block 顺序指定 W/A bit，例如 4,4,2,2,4,4")
+    parser.add_argument("--depth-weight-bit-profile", dest="depth_weight_bit_profile", type=str, help="按 Transformer block 顺序指定 weight bit")
+    parser.add_argument("--depth-act-bit-profile", dest="depth_act_bit_profile", type=str, help="按 Transformer block 顺序指定 activation bit")
     parser.add_argument("--wq-per-channel", dest="wq_per_channel", action="store_true")
     parser.add_argument("--aq-per-channel", dest="aq_per_channel", action="store_true")
     parser.add_argument("--wq-clip-learnable", dest="wq_clip_learnable", action="store_true")
