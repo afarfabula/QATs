@@ -596,6 +596,7 @@ def build_ofq(args: argparse.Namespace) -> Tuple[List[str], Path, Dict[str, str]
     append_optional_value(command, "--anchor-ref-warmup-epochs", args.anchor_ref_warmup_epochs)
     append_optional_value(command, "--anchor-ref-head-mode", args.anchor_ref_head_mode)
     append_optional_value(command, "--teacher-attn-kl-weight", args.teacher_attn_kl_weight)
+    append_optional_value(command, "--teacher-attn-kl-temperature", getattr(args, "teacher_attn_kl_temperature", None))
     append_optional_value(command, "--teacher-attn-kl-warmup-epochs", args.teacher_attn_kl_warmup_epochs)
     append_optional_value(command, "--teacher-attn-kl-weight-epoch-overrides", getattr(args, "teacher_attn_kl_weight_epoch_overrides", None))
     append_optional_value(command, "--teacher-attn-output-weight", args.teacher_attn_output_weight)
@@ -954,6 +955,7 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--ref-warmup-updates", dest="ref_warmup_updates", type=int)
     parser.add_argument("--ref-stop-updates", dest="ref_stop_updates", type=int)
     parser.add_argument("--teacher-attn-kl-weight", dest="teacher_attn_kl_weight", type=float)
+    parser.add_argument("--teacher-attn-kl-temperature", dest="teacher_attn_kl_temperature", type=float)
     parser.add_argument("--teacher-attn-kl-warmup-epochs", dest="teacher_attn_kl_warmup_epochs", type=int)
     parser.add_argument("--teacher-attn-kl-weight-epoch-overrides", dest="teacher_attn_kl_weight_epoch_overrides", type=str)
     parser.add_argument("--attn-rank-weight", dest="attn_rank_weight", type=float)
@@ -972,6 +974,9 @@ def build_ofq_runtime_overrides(extra_args: Sequence[str]) -> Dict[str, object]:
     parser.add_argument("--attention-quant-topk-mass-weight", dest="attention_quant_topk_mass_weight", type=float)
     parser.add_argument("--attention-quant-topk", dest="attention_quant_topk", type=int)
     parser.add_argument("--attention-quant-probe", dest="attention_quant_probe", action="store_true")
+    parser.add_argument("--attention-softmax-quantizer", dest="attention_softmax_quantizer", type=str)
+    parser.add_argument("--attention-softmax-nonuniform-percentile", dest="attention_softmax_nonuniform_percentile", type=float)
+    parser.add_argument("--attention-softmax-nonuniform-calibration-steps", dest="attention_softmax_nonuniform_calibration_steps", type=int)
     parser.add_argument("--attention-softmax-post-quant-renorm", dest="attention_softmax_post_quant_renorm", action="store_true")
     parser.add_argument("--attention-softmax-fp", dest="attention_softmax_fp", action="store_true")
     parser.add_argument("--attention-softmax-fp-layers", dest="attention_softmax_fp_layers", type=str)
@@ -1498,6 +1503,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "anchor_ref_warmup_epochs": 0,
         "anchor_ref_head_mode": "",
         "teacher_attn_kl_weight": 0.0,
+        "teacher_attn_kl_temperature": 1.0,
         "teacher_attn_kl_warmup_epochs": 0,
         "teacher_attn_kl_weight_epoch_overrides": "",
         "attn_rank_weight": 0.0,
@@ -1516,6 +1522,9 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         "attention_quant_topk_mass_weight": 0.0,
         "attention_quant_topk": 5,
         "attention_quant_probe": False,
+        "attention_softmax_quantizer": "lsq",
+        "attention_softmax_nonuniform_percentile": 0.999,
+        "attention_softmax_nonuniform_calibration_steps": 20,
         "attention_softmax_post_quant_renorm": False,
         "attention_softmax_fp": False,
         "attention_softmax_fp_layers": "",
@@ -1861,6 +1870,8 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["anchor_ref_head_mode"] = args.anchor_ref_head_mode
     if args.teacher_attn_kl_weight is not None:
         defaults["teacher_attn_kl_weight"] = args.teacher_attn_kl_weight
+    if getattr(args, "teacher_attn_kl_temperature", None) is not None:
+        defaults["teacher_attn_kl_temperature"] = args.teacher_attn_kl_temperature
     if args.teacher_attn_kl_warmup_epochs is not None:
         defaults["teacher_attn_kl_warmup_epochs"] = args.teacher_attn_kl_warmup_epochs
     if getattr(args, "teacher_attn_kl_weight_epoch_overrides", None) is not None:
@@ -1897,6 +1908,12 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
         defaults["attention_quant_topk"] = args.attention_quant_topk
     if getattr(args, "attention_quant_probe", False):
         defaults["attention_quant_probe"] = True
+    if getattr(args, "attention_softmax_quantizer", None) is not None:
+        defaults["attention_softmax_quantizer"] = args.attention_softmax_quantizer
+    if getattr(args, "attention_softmax_nonuniform_percentile", None) is not None:
+        defaults["attention_softmax_nonuniform_percentile"] = args.attention_softmax_nonuniform_percentile
+    if getattr(args, "attention_softmax_nonuniform_calibration_steps", None) is not None:
+        defaults["attention_softmax_nonuniform_calibration_steps"] = args.attention_softmax_nonuniform_calibration_steps
     if getattr(args, "attention_softmax_post_quant_renorm", False):
         defaults["attention_softmax_post_quant_renorm"] = True
     if getattr(args, "attention_softmax_fp", False):
@@ -2320,6 +2337,12 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["anchor_ref_warmup_epochs"] = int(defaults["anchor_ref_warmup_epochs"])
     defaults["anchor_ref_head_mode"] = str(defaults.get("anchor_ref_head_mode") or "")
     defaults["teacher_attn_kl_weight"] = float(defaults["teacher_attn_kl_weight"])
+    defaults["teacher_attn_kl_temperature"] = float(defaults.get("teacher_attn_kl_temperature", 1.0))
+    if defaults["teacher_attn_kl_temperature"] <= 0.0:
+        raise ValueError(
+            "teacher_attn_kl_temperature must be positive, "
+            f"got {defaults['teacher_attn_kl_temperature']}"
+        )
     defaults["teacher_attn_kl_warmup_epochs"] = int(defaults["teacher_attn_kl_warmup_epochs"])
     defaults["teacher_attn_kl_weight_epoch_overrides"] = parse_epoch_float_overrides(defaults.get("teacher_attn_kl_weight_epoch_overrides"))
     defaults["attn_rank_weight"] = float(defaults.get("attn_rank_weight", 0.0) or 0.0)
@@ -2349,6 +2372,22 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["attention_quant_topk_mass_weight"] = float(defaults.get("attention_quant_topk_mass_weight", 0.0) or 0.0)
     defaults["attention_quant_topk"] = int(defaults.get("attention_quant_topk", 5) or 5)
     defaults["attention_quant_probe"] = bool(defaults.get("attention_quant_probe", False))
+    defaults["attention_softmax_quantizer"] = str(defaults.get("attention_softmax_quantizer", "lsq") or "lsq").strip().lower()
+    if defaults["attention_softmax_quantizer"] not in {"lsq", "log_uniform"}:
+        raise ValueError(
+            "attention_softmax_quantizer must be lsq or log_uniform, "
+            f"got {defaults['attention_softmax_quantizer']}"
+        )
+    defaults["attention_softmax_nonuniform_percentile"] = float(
+        defaults.get("attention_softmax_nonuniform_percentile", 0.999)
+    )
+    if not 0.5 < defaults["attention_softmax_nonuniform_percentile"] < 1.0:
+        raise ValueError("attention_softmax_nonuniform_percentile must be in (0.5, 1)")
+    defaults["attention_softmax_nonuniform_calibration_steps"] = int(
+        defaults.get("attention_softmax_nonuniform_calibration_steps", 20)
+    )
+    if defaults["attention_softmax_nonuniform_calibration_steps"] < 1:
+        raise ValueError("attention_softmax_nonuniform_calibration_steps must be positive")
     defaults["attention_softmax_post_quant_renorm"] = bool(defaults.get("attention_softmax_post_quant_renorm", False))
     defaults["attention_softmax_fp"] = bool(defaults.get("attention_softmax_fp", False))
     defaults["attention_softmax_fp_layers"] = str(defaults.get("attention_softmax_fp_layers", "") or "")
@@ -3476,6 +3515,117 @@ def configure_attention_softmax_post_quant_renorm(model: nn.Module, enabled: boo
         if not hasattr(module, "quan_a_softmax_fn"):
             continue
         module.attention_softmax_post_quant_renorm = bool(enabled)
+        configured += 1
+    return configured
+
+
+class LogUniformAttentionQuantizer(nn.Module):
+    """Four-level positive log-uniform attention quantizer with row normalization."""
+
+    def __init__(
+        self,
+        bit: int = 2,
+        percentile: float = 0.999,
+        calibration_steps: int = 20,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.bit = int(bit)
+        self.levels = 2 ** self.bit
+        self.percentile = float(percentile)
+        self.calibration_steps = max(1, int(calibration_steps))
+        self.eps = float(eps)
+        self.register_buffer("log_low", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("log_high", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_initialized", torch.zeros((), dtype=torch.bool), persistent=False)
+        self.register_buffer("_calibration_count", torch.zeros((), dtype=torch.long), persistent=False)
+
+    def _sample_stats(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        sample = x.detach().float().reshape(-1)
+        sample = sample[sample > self.eps]
+        if sample.numel() == 0:
+            return x.new_tensor(self.eps), x.new_tensor(1.0)
+        stride = max(1, sample.numel() // 131072)
+        sample = sample[::stride][:131072]
+        low_q = 1.0 - self.percentile
+        low = torch.quantile(sample, low_q)
+        high = torch.quantile(sample, self.percentile)
+        high = torch.maximum(high, low * 1.01 + self.eps)
+        return low, high
+
+    def _sync_scalar(self, value: torch.Tensor, op: torch.distributed.ReduceOp) -> torch.Tensor:
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            value = value.clone()
+            torch.distributed.all_reduce(value, op=op)
+        return value
+
+    @torch.no_grad()
+    def _update_bounds(self, x: torch.Tensor) -> None:
+        low, high = self._sample_stats(x)
+        low = self._sync_scalar(low, torch.distributed.ReduceOp.MIN)
+        high = self._sync_scalar(high, torch.distributed.ReduceOp.MAX)
+        low_log = torch.log(low.clamp_min(self.eps))
+        high_log = torch.log(high.clamp_min(torch.exp(low_log) + self.eps))
+        if not bool(self._initialized):
+            self.log_low.copy_(low_log)
+            self.log_high.copy_(high_log)
+            self._initialized.fill_(True)
+        elif int(self._calibration_count) < self.calibration_steps:
+            self.log_low.lerp_(low_log, 0.1)
+            self.log_high.lerp_(high_log, 0.1)
+        self._calibration_count.add_(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training or not bool(self._initialized):
+            self._update_bounds(x)
+        low = self.log_low.to(device=x.device, dtype=torch.float32)
+        high = self.log_high.to(device=x.device, dtype=torch.float32)
+        step = ((high - low) / max(1, self.levels - 1)).clamp_min(1e-4)
+        log_prob = torch.log(x.float().clamp_min(self.eps))
+        scaled = ((log_prob - low) / step).clamp(0.0, float(self.levels - 1))
+        scaled = scaled + (scaled.round() - scaled).detach()
+        quantized = torch.exp(low + step * scaled)
+        quantized = quantized / quantized.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        return quantized.to(dtype=x.dtype)
+
+    def forward_detached_scale(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward(x)
+
+    def extra_repr(self) -> str:
+        return (
+            f"bit={self.bit}, levels={self.levels}, "
+            f"percentile={self.percentile}, calibration_steps={self.calibration_steps}"
+        )
+
+
+def configure_attention_softmax_quantizer(
+    model: nn.Module,
+    quantizer_name: str,
+    percentile: float = 0.999,
+    calibration_steps: int = 20,
+) -> int:
+    """Replace only post-softmax attention quantizers, leaving all other AQ unchanged."""
+    name = str(quantizer_name or "lsq").strip().lower()
+    if name == "lsq":
+        return 0
+    if name != "log_uniform":
+        raise ValueError(f"Unsupported attention softmax quantizer: {quantizer_name}")
+    configured = 0
+    for module in model.modules():
+        current = getattr(module, "quan_a_softmax_fn", None)
+        if current is None:
+            continue
+        bit = int(getattr(current, "bit", 2))
+        replacement = LogUniformAttentionQuantizer(
+            bit=bit,
+            percentile=percentile,
+            calibration_steps=calibration_steps,
+        )
+        module.quan_a_softmax_fn = replacement
         configured += 1
     return configured
 
@@ -5625,7 +5775,23 @@ def dynamic_ref_head_mode(head_mode: str) -> Tuple[Optional[int], str, bool, boo
     return None, mode, False, False
 
 
-def attention_kl_pair_loss(student_attn: torch.Tensor, ref_attn: torch.Tensor, loss_type: str) -> torch.Tensor:
+def retemper_attention_prob(attn: torch.Tensor, temperature: float, eps: float = 1e-8) -> torch.Tensor:
+    """Re-temper post-softmax probabilities while preserving a T=1 fast path."""
+    temperature = float(temperature)
+    if temperature == 1.0:
+        return attn
+    if temperature <= 0.0:
+        raise ValueError(f"attention KL temperature must be positive, got {temperature}")
+    logits = torch.log(attn.float().clamp_min(eps)) / temperature
+    return torch.softmax(logits, dim=-1)
+
+
+def attention_kl_pair_loss(
+    student_attn: torch.Tensor,
+    ref_attn: torch.Tensor,
+    loss_type: str,
+    temperature: float = 1.0,
+) -> torch.Tensor:
     if loss_type in {"cosine", "centered_cosine"}:
         student_vec = student_attn.float().flatten(1)
         ref_vec = ref_attn.float().flatten(1)
@@ -5633,8 +5799,8 @@ def attention_kl_pair_loss(student_attn: torch.Tensor, ref_attn: torch.Tensor, l
             student_vec = student_vec - student_vec.mean(dim=1, keepdim=True)
             ref_vec = ref_vec - ref_vec.mean(dim=1, keepdim=True)
         return (1.0 - F.cosine_similarity(student_vec, ref_vec.detach(), dim=1, eps=1e-8)).mean()
-    student_prob = student_attn.clamp_min(1e-8)
-    ref_prob = ref_attn.clamp_min(1e-8)
+    student_prob = retemper_attention_prob(student_attn, temperature).clamp_min(1e-8)
+    ref_prob = retemper_attention_prob(ref_attn, temperature).clamp_min(1e-8)
     if loss_type == "kl_ref":
         return F.kl_div(torch.log(student_prob), ref_prob, reduction="batchmean")
     if loss_type == "symmetric_kl":
@@ -5662,7 +5828,14 @@ def maybe_clip_ref_loss(loss: torch.Tensor, clip_value: float = 0.0) -> torch.Te
 _DYNAMIC_HEAD_SCORE_EMA: Dict[str, torch.Tensor] = {}
 
 
-def attention_kl_consistency_loss(student_attn_info, ref_attn_info, head_mode: str = "all", loss_type: str = "kl_ref", clip_value: float = 0.0) -> torch.Tensor:
+def attention_kl_consistency_loss(
+    student_attn_info,
+    ref_attn_info,
+    head_mode: str = "all",
+    loss_type: str = "kl_ref",
+    clip_value: float = 0.0,
+    temperature: float = 1.0,
+) -> torch.Tensor:
     student_list = extract_attn_prob_list(student_attn_info)
     ref_list = extract_attn_prob_list(ref_attn_info)
     first_tensor = next((x for x in student_list if torch.is_tensor(x)), None)
@@ -5714,7 +5887,10 @@ def attention_kl_consistency_loss(student_attn_info, ref_attn_info, head_mode: s
             for current_head in head_range:
                 student_head = student_attn[:, current_head : current_head + 1]
                 ref_head = ref_attn[:, current_head : current_head + 1]
-                head_loss = maybe_clip_ref_loss(attention_kl_pair_loss(student_head, ref_head, loss_type), clip_value)
+                head_loss = maybe_clip_ref_loss(
+                    attention_kl_pair_loss(student_head, ref_head, loss_type, temperature=temperature),
+                    clip_value,
+                )
                 head_losses.append(head_loss)
                 head_keys.append((int(layer_idx), int(current_head)))
                 layer_losses.setdefault(layer_idx, []).append(head_loss)
@@ -5758,7 +5934,10 @@ def attention_kl_consistency_loss(student_attn_info, ref_attn_info, head_mode: s
                 continue
             student_attn = student_attn[:, head_idx : head_idx + 1]
             ref_attn = ref_attn[:, head_idx : head_idx + 1]
-        total = total + maybe_clip_ref_loss(attention_kl_pair_loss(student_attn, ref_attn, loss_type), clip_value)
+        total = total + maybe_clip_ref_loss(
+            attention_kl_pair_loss(student_attn, ref_attn, loss_type, temperature=temperature),
+            clip_value,
+        )
         count += 1
     return total / max(count, 1)
 
@@ -6866,6 +7045,151 @@ def compute_ofq_batch_loss(input, target, model: nn.Module, loss_fn, runtime_arg
                 loss = loss + runtime_args.ref_logit_kl_weight * ref_logit_kl_loss
         return loss, base_loss_for_log, ref_attn_kl_loss.detach(), ref_logit_kl_loss.detach(), anchor_ref_attn_kl_loss.detach(), teacher_attn_kl_loss.detach(), teacher_qk_rel_loss.detach()
 
+def _dsh_teacher_kl_probe(model, teacher, runtime_args, epoch, head_mode, n_batches=6):
+    """[DSH] One-off diagnostic: measure the teacher-attention KL in-process, before saving."""
+    import os as _os
+    inner = maybe_unwrap_ddp(model)
+    was_training = inner.training
+    cfg = resolve_data_config(vars(runtime_args), model=None)
+    ds = create_dataset_compat(
+        runtime_args.dataset,
+        root=runtime_args.data_dir,
+        split=runtime_args.val_split,
+        is_training=False,
+        batch_size=32,
+        subset_ratio=1.0,
+        rank=0,
+        world_size=1,
+    )
+    ld = create_loader_compat(
+        ds,
+        input_size=cfg["input_size"],
+        batch_size=32,
+        is_training=False,
+        use_prefetcher=False,
+        interpolation=cfg["interpolation"],
+        mean=cfg["mean"],
+        std=cfg["std"],
+        num_workers=4,
+        distributed=False,
+        crop_pct=cfg["crop_pct"],
+        pin_memory=False,
+    )
+
+    def _run(use_amp):
+        inner.eval()
+        vals, stats = [], []
+        try:
+            with torch.no_grad():
+                for i, batch in enumerate(ld):
+                    if i >= n_batches:
+                        break
+                    imgs = batch[0] if not isinstance(batch, torch.Tensor) else batch
+                    imgs = imgs.cuda(non_blocking=True)
+                    if use_amp:
+                        with torch.autocast("cuda", dtype=torch.bfloat16):
+                            s_out = inner(imgs)
+                            t_out = teacher(imgs)
+                            loss = attention_kl_consistency_loss(
+                                s_out[1], t_out[1], head_mode=head_mode,
+                                loss_type="kl_ref", clip_value=0.0, temperature=2.0)
+                    else:
+                        s_out = inner(imgs)
+                        t_out = teacher(imgs)
+                        loss = attention_kl_consistency_loss(
+                            s_out[1], t_out[1], head_mode=head_mode,
+                            loss_type="kl_ref", clip_value=0.0, temperature=2.0)
+                    vals.append(float(loss))
+                    lst = extract_attn_prob_list(s_out[1])
+                    for li in (8, 9, 10, 11):
+                        if li < len(lst) and torch.is_tensor(lst[li]):
+                            x = lst[li].float()
+                            ssum = x.sum(-1)
+                            p = x / ssum.clamp_min(1e-8).unsqueeze(-1)
+                            h = -(p * p.clamp_min(1e-8).log()).sum(-1).mean()
+                            stats.append((float(ssum.mean()), float((x == 0).float().mean()), float(h)))
+            kl = sum(vals) / max(len(vals), 1)
+            mass = sum(t[0] for t in stats) / max(len(stats), 1)
+            zero = sum(t[1] for t in stats) / max(len(stats), 1)
+            ent = sum(t[2] for t in stats) / max(len(stats), 1)
+            print(f"[DSH-PROBE] epoch={epoch} amp={int(use_amp)} KL={kl:.3f} "
+                  f"collected_attn mass={mass:.4f} zero={zero:.4f} H={ent:.3f} n={len(vals)}", flush=True)
+        finally:
+            inner.train(was_training)
+
+    _run(False)
+    _run(True)
+    s_list = [p.detach().float().flatten() for n, p in inner.named_parameters()
+              if n.endswith("quan_a_softmax_fn.s")]
+    if s_list:
+        all_s = torch.cat(s_list)
+        print(f"[DSH-PROBE] softmax_scale s: mean={all_s.mean():.6f} min={all_s.min():.6f} "
+              f"max={all_s.max():.6f} n={all_s.numel()}", flush=True)
+
+
+def _dsh_quantize_attn_info(attn_info, model):
+    """[DSH] 用学生同一套 post-softmax 量化器把教师注意力过一遍（按层号对齐）。"""
+    if attn_info is None:
+        return None
+    mods = {}
+    for name, mod in maybe_unwrap_ddp(model).named_modules():
+        if not name.endswith("quan_a_softmax_fn"):
+            continue
+        if not hasattr(mod, "forward_detached_scale"):
+            continue
+        idx = next((int(p) for p in name.split(".") if p.isdigit()), None)
+        if idx is not None:
+            mods[idx] = mod
+    out = []
+    for layer, item in enumerate(attn_info):
+        if item is None or not torch.is_tensor(item):
+            out.append(item)
+            continue
+        mod = mods.get(layer)
+        if mod is None:
+            out.append(item)
+            continue
+        q = mod(item.float())
+        out.append(q.to(item.dtype))
+    return out
+
+
+def _dsh_topk_recall_loss(student_attn_info, teacher_attn_info, head_mode, k=5):
+    """[DSH] 教师 top-k 支撑被学生 top-k 覆盖的比例（1 - recall）。"""
+    s_list = extract_attn_prob_list(student_attn_info)
+    t_list = extract_attn_prob_list(teacher_attn_info)
+    sel = parse_ref_head_mode(head_mode)
+    if sel is None:
+        items = [(i, None) for i in range(min(len(s_list), len(t_list)))]
+    else:
+        items = list(sel)
+    total = None
+    count = 0
+    for layer, head in items:
+        if layer >= len(s_list) or layer >= len(t_list):
+            continue
+        s_attn, t_attn = s_list[layer], t_list[layer]
+        if s_attn is None or t_attn is None or s_attn.ndim < 4:
+            continue
+        if head is not None:
+            if head >= s_attn.shape[1] or head >= t_attn.shape[1]:
+                continue
+            s_attn = s_attn[:, head:head + 1]
+            t_attn = t_attn[:, head:head + 1]
+        kk = min(int(k), s_attn.shape[-1], t_attn.shape[-1])
+        t_idx = t_attn.float().topk(kk, dim=-1).indices
+        mask = torch.zeros_like(s_attn, dtype=torch.float32).scatter_(-1, t_idx, 1.0)
+        p_student = s_attn.float().clamp_min(0.0)
+        denom = p_student.sum(dim=-1).clamp_min(1e-8)
+        covered = (p_student * mask).sum(dim=-1) / denom
+        layer_loss = 1.0 - covered.mean()
+        total = layer_loss if total is None else total + layer_loss
+        count += 1
+    if total is None:
+        return torch.zeros((), device="cuda")
+    return total / max(count, 1)
+
+
 def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.optim.Optimizer, loss_fn, runtime_args: SimpleNamespace, lr_scheduler: WarmupCosineScheduler, output_dir: Path, amp_autocast, loss_scaler, teacher: Optional[nn.Module], mixup_fn, ref_model: Optional[nn.Module] = None, anchor_ref_model: Optional[nn.Module] = None, model_ema: Optional[nn.Module] = None, confidence_ref_model: Optional[nn.Module] = None):
     if runtime_args.mixup_off_epoch and epoch >= runtime_args.mixup_off_epoch:
         if runtime_args.prefetcher and hasattr(loader, "mixup_enabled"):
@@ -7497,18 +7821,32 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                         print(
                             "Teacher attention-KL debug: "
                             f"weight={runtime_args.teacher_attn_kl_weight}, "
+                            f"temperature={runtime_args.teacher_attn_kl_temperature}, "
                             f"head_mode={runtime_args.ref_head_mode}, "
                             f"student_layers={len(student_attn_list)}, student_valid={student_valid}, "
                             f"teacher_layers={len(teacher_attn_list)}, teacher_valid={teacher_valid}"
                         )
                         logged_teacher_attn_kl_debug = True
-                    teacher_attn_kl_loss = attention_kl_consistency_loss(
-                        student_attn_info,
-                        teacher_attn_info_for_kl,
-                        head_mode=runtime_args.ref_head_mode,
-                        loss_type=runtime_args.ref_attn_loss,
-                        clip_value=runtime_args.ref_attn_kl_clip,
-                    )
+                    if os.environ.get("DSH_TEACHER_KL_TARGET", "") == "quantized":
+                        teacher_attn_info_for_kl = _dsh_quantize_attn_info(teacher_attn_info_for_kl, model)
+                    _dsh_topk_w = float(os.environ.get("DSH_TOPK_RECALL_WEIGHT", "0") or 0.0)
+                    if _dsh_topk_w > 0.0:
+                        runtime_args.teacher_attn_kl_weight = _dsh_topk_w
+                        teacher_attn_kl_loss = _dsh_topk_recall_loss(
+                            student_attn_info,
+                            teacher_attn_info_for_kl,
+                            runtime_args.ref_head_mode,
+                            k=int(os.environ.get("DSH_TOPK_RECALL_K", "5") or 5),
+                        )
+                    else:
+                        teacher_attn_kl_loss = attention_kl_consistency_loss(
+                            student_attn_info,
+                            teacher_attn_info_for_kl,
+                            head_mode=runtime_args.ref_head_mode,
+                            loss_type=runtime_args.ref_attn_loss,
+                            clip_value=runtime_args.ref_attn_kl_clip,
+                            temperature=runtime_args.teacher_attn_kl_temperature,
+                        )
                     loss = loss + runtime_args.teacher_attn_kl_weight * teacher_attn_kl_loss
                 use_teacher_qk_rel_scheme = (
                     runtime_args.train_scheme == "ema_ref_attn_kl"
@@ -8078,6 +8416,20 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
 
     if runtime_args.quantized:
         model = get_ofq_qat_model(model, runtime_args)
+    if runtime_args.attention_softmax_quantizer != "lsq":
+        configured = configure_attention_softmax_quantizer(
+            model,
+            runtime_args.attention_softmax_quantizer,
+            percentile=runtime_args.attention_softmax_nonuniform_percentile,
+            calibration_steps=runtime_args.attention_softmax_nonuniform_calibration_steps,
+        )
+        if runtime_args.local_rank == 0:
+            print(
+                "Configured post-softmax attention quantizer: "
+                f"name={runtime_args.attention_softmax_quantizer}, modules={configured}, "
+                f"percentile={runtime_args.attention_softmax_nonuniform_percentile}, "
+                f"calibration_steps={runtime_args.attention_softmax_nonuniform_calibration_steps}"
+            )
     if runtime_args.attention_softmax_post_quant_renorm:
         configured = configure_attention_softmax_post_quant_renorm(model, True)
         if runtime_args.local_rank == 0:
@@ -8819,6 +9171,11 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                 dataset_train.set_epoch(epoch)
             if runtime_args.distributed and hasattr(loader_train, "sampler") and hasattr(loader_train.sampler, "set_epoch"):
                 loader_train.sampler.set_epoch(epoch)
+            if os.environ.get("DSH_FREEZE_ATTN_S", "") == "1":
+                _n_frozen = freeze_attention_softmax_scales(model)
+                if runtime_args.local_rank == 0:
+                    print(f"[DSH] froze attention softmax scales: {_n_frozen} tensors", flush=True)
+
             train_metrics, total_update_count, stopped_early = train_one_epoch_ofq(
                 epoch,
                 model,
@@ -8837,6 +9194,14 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                 model_ema,
                 confidence_ref_model,
             )
+            if os.environ.get("DSH_TEACHER_KL_PROBE") == "1" and runtime_args.local_rank == 0:
+                try:
+                    _dsh_teacher_kl_probe(
+                        model, teacher, runtime_args, epoch,
+                        getattr(runtime_args, "ref_head_mode", "all"),
+                    )
+                except Exception as _probe_err:
+                    print(f"[DSH-PROBE] failed: {_probe_err!r}", flush=True)
             if runtime_args.local_rank == 0:
                 print("epoch: ", epoch, "g['lr']: ", optimizer.param_groups[0]["lr"])
             post_epoch_feature_recon_updates = int(getattr(runtime_args, "post_epoch_feature_recon_updates", 0))
@@ -9302,6 +9667,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor-ref-warmup-epochs", dest="anchor_ref_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 anchor refmodel attention KL")
     parser.add_argument("--anchor-ref-head-mode", dest="anchor_ref_head_mode", type=str, default=None, help="固定 anchor refmodel 单独使用的 head mode；为空则沿用 --ref-head-mode")
     parser.add_argument("--teacher-attn-kl-weight", dest="teacher_attn_kl_weight", type=float, default=None, help="FP teacher attention KL 权重")
+    parser.add_argument("--teacher-attn-kl-temperature", dest="teacher_attn_kl_temperature", type=float, default=None, help="FP teacher attention KL 概率温度；对 student/teacher post-softmax 概率同时重标定")
     parser.add_argument("--teacher-attn-kl-warmup-epochs", dest="teacher_attn_kl_warmup_epochs", type=int, default=None, help="多少个 epoch 后启用 FP teacher attention KL")
     parser.add_argument("--teacher-attn-kl-weight-epoch-overrides", dest="teacher_attn_kl_weight_epoch_overrides", type=str, default=None, help="按 epoch 覆盖 FP teacher attention KL 权重，格式 epoch:value,epoch:value")
     parser.add_argument("--attn-rank-weight", dest="attn_rank_weight", type=float, default=None, help="教师注意力大小关系（top-k key 成对排序）损失权重；>0 时自动开启注意力采集")

@@ -221,3 +221,66 @@ The strongest public Swin-T W4A4-family result verified here is VVTQ Swin-T W4A4
 2. Reproduce OFQ Swin-T W4A4 as the closest method family to our current QATs/OFQ code. It remains the best direct OFQ-family baseline with QKR/CGA.
 3. Audit GPLQ as a staged alternative after VVTQ/OFQ are understood. It is promising because it directly attacks short-horizon convergence by avoiding direct W4A4 full-model QAT at the beginning.
 4. Use PTQ4ViT/FQ-ViT/RepQ/APHQ/LSQ/PACT only as mechanism references unless their code is ported into a clearly gated local experiment.
+
+## 2026-11-12 addendum: layer-wise mixed precision and ternary ViT
+
+This addendum records a focused public-work audit for the proposed setting:
+
+- QAT rather than PTQ;
+- a separate bit-width or quantizer assignment for each Transformer block;
+- a heterogeneous set including 8/4/2-bit and a sub-2-bit/three-state region;
+- DeiT and Swin;
+- direct comparison with the uniform-bit Q-ViT and OFQ QAT families.
+
+### Bottom line
+
+No exact public work was found with all of these conditions simultaneously. In particular, we have not found an official paper/repo that performs **QAT with a layer-wise mixed assignment spanning 8/4/2/ternary across DeiT/Swin and directly compares that setting with Q-ViT and OFQ under equal average-bit and deployment budgets**.
+
+This does not mean mixed-precision QAT for ViTs is unexplored. The distinction is important:
+
+1. Layer-wise mixed-precision ViT quantization is already established, mainly as PTQ;
+2. mixed-precision QAT exists, but is usually hardware/NAS-oriented (Quasar-ViT) or intra-layer/window-oriented (Mixa-Q);
+3. three-state/ternary ViT quantization exists, mostly uniformly at model level;
+4. Q-ViT (NeurIPS 2022 official version) and OFQ (ICML 2023) are uniform-bit QAT baselines, not layer-wise MPQ baselines.
+
+Therefore, the proposed direction is adjacent to prior work, not a completely empty problem. The defensible novelty must be the **joint QAT allocation of heterogeneous codebooks across depth under an explicit resource budget**, not merely the use of different bits in different blocks.
+
+### Closest public work
+
+| work | venue/status | training type | mixed-precision granularity | sub-2-bit/ternary? | relevance to the proposed setting |
+|---|---|---|---|---|---|
+| [LampQ](https://github.com/snudatalab/LampQ) | AAAI 2026 | PTQ + block reconstruction | per-layer and per-module weights; separate QKV/proj/fc1/fc2 lists | example allocation includes a 1-bit `fc1`; no 3-state codebook | strongest direct evidence that per-layer/module heterogeneous bit allocation is already studied |
+| [Patch-wise MPQ](https://doi.org/10.1109/ijcnn54540.2023.10191205) | IJCNN 2023 | mixed-precision ViT compression | layer-wise and patch-wise allocation | not established from abstract | shows both depth-wise and intra-layer allocation are prior art |
+| [Quasar-ViT](https://doi.org/10.1145/3650200.3656622) | ICS 2024 | QAT supernet + hardware-aware search | row-wise flexible mixed precision, searched per subnet | no ternary/layer-wise 8/4/2 policy established | closest QAT-side evidence; novelty is largely architecture/hardware search |
+| [Mixa-Q](https://doi.org/10.1109/iccv51701.2025.02056) | ICCV 2025 | QAT and PTQ configurations | mixed activation precision across windows inside Swin blocks | lower precision assigned to sparse/less important windows | directly relevant to Swin activation allocation, but not a block-wise 8/4/2/ternary schedule |
+| [MPTQ-ViT](https://doi.org/10.48550/arxiv.2401.14895) | arXiv 2024 | PTQ | layer-wise greedy bit allocation | no confirmed ternary depth allocation | DeiT/Swin layer-wise MPQ precedent |
+| [AMP-ViT](https://doi.org/10.1109/wacv61041.2025.00664) | WACV 2025 | adaptive PTQ | mixed precision from activation sensitivity | no confirmed ternary depth allocation | strong DeiT/Swin MPQ comparison baseline |
+| [Selective Ternary and Multi-Precision PTQ](https://doi.org/10.1109/icscst70031.2026.11709677) | ICSCST 2026 | PTQ | selected MLP blocks use ternary weights, other regions use multi-precision/INT8 | yes | closest existing combination of ternary selection and MPQ, but PTQ rather than QAT |
+| [TerViT](https://doi.org/10.48550/arxiv.2201.08050) | arXiv 2022, not verified as an accepted venue paper | progressive low-bit training | uniform ternary weights | yes, three-state weights | proves DeiT/Swin ternary weights are prior art; it is not layer-wise MPQ |
+| Q-ViT NeurIPS 2022 | NeurIPS 2022 | QAT | uniform low-bit in the official code; IRM + DGD | no | required baseline, but not a layer-wise MPQ paper |
+| OFQ | ICML 2023 | QAT + CGA fine-tuning | uniform W/A bits in official scripts | no | required baseline, but not a layer-wise MPQ paper |
+
+The early 2022 arXiv paper [Q-ViT: Fully Differentiable Quantization for Vision Transformer](https://doi.org/10.48550/arxiv.2201.07703) is a separate precursor and should not be confused with the NeurIPS 2022 Q-ViT code. It proposed learnable head-wise bit-widths. That is adjacent prior art for learnable precision, but it is head-wise rather than a layer-wise 12-block allocation and does not establish the proposed 8/4/2/ternary QAT schedule.
+
+### Required comparison protocol
+
+The proposed method should not be compared only as `mixed bits vs uniform W4A4`. That is not a single-variable comparison.
+
+1. Report the exact block list. A 12-block model must have exactly 12 block entries; patch embedding, patch merging, normalization, and classification head must be listed separately.
+2. Report weight bits and activation bits independently. A string such as `8/4/4/...` is ambiguous unless W/A are both specified.
+3. Report average bits, packed model size, bit-operations, and measured latency. The apparent average bit-width alone is insufficient.
+4. Compare at matched average bits/model size and at matched latency, not only at the nominally lowest bit-width.
+5. Include uniform Q-ViT and OFQ at W4A4 and W2A2, plus layer-wise MPQ baselines such as LampQ/AMP-ViT where runnable.
+6. Use the same initialization, epoch budget, data pipeline, and QAT loss for all runs. Official OFQ uses `CE + soft KD`; pure soft-KD should not be the only recipe.
+
+### Definition of the sub-2-bit entry
+
+If one block has only three quantized states per element, the setting is ternary. The ideal entropy is `log2(3) = 1.585` bits/value. A reported `1.67` is therefore a coding/overhead-inclusive or average value unless a precise non-uniform codebook is defined. It should not be presented as a hardware-native `1.67-bit integer` format without stating the packing and arithmetic mechanism.
+
+### Defensible research claim
+
+The strongest claim supported by the literature gap is:
+
+> QAT with a jointly selected heterogeneous quantizer policy across all Transformer blocks, including ternary/2/4/8 choices for DeiT and Swin, evaluated under equal average-bit and deployment budgets and compared with uniform Q-ViT/OFQ plus existing MPQ methods.
+
+Merely manually choosing a favorable bit list is likely to be viewed as a combination of existing mixed-precision and ternary ideas. A stronger contribution is an allocation rule or search objective that predicts the per-layer quantizer policy from the discrete forward behavior and transfers across DeiT and Swin.

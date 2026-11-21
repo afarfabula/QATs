@@ -460,3 +460,18 @@ PY
 - 所有 Top-1 来自 ImageNet-1K val 全量 50,000 张，单点二项标准误 ≈ 0.18 分。
 - 全部为单 seed（seed=42）轨迹；相邻 epoch 强自相关，配对差值的朴素 t 值不能直接当显著性。
 - “胜出轮数”是描述性统计，不是假设检验。
+
+## 10. 2026-11-12 混合精度 / ternary 文献补充
+
+针对“QAT 下逐层分配 8/4/2/ternary 位宽”的可行性，补充审计结论如下：
+
+1. **未找到完全同设定工作**：QAT、DeiT/Swin、12 个 block 的异构 8/4/2/ternary 分配，并在相同平均 bit/部署预算下直接对比 Q-ViT 和 OFQ。
+2. **不能说 QAT 混合精度没人做**：Quasar-ViT 使用 QAT supernet 和硬件感知混合精度搜索；Mixa-Q 在 Swin 的 window 级使用混合 activation precision。
+3. **逐层混合位宽本身已有**：LampQ（AAAI 2026）做 layer/module-wise MPQ，但属于 PTQ；Patch-wise MPQ 也同时覆盖 layer/patch 粒度。
+4. **ternary + MPQ 的组合已有 PTQ**：Selective Ternary and Multi-Precision PTQ 只对部分 MLP block 使用 ternary，其余保持多精度/INT8。
+5. **Q-ViT 和 OFQ 的官方主结果都是 uniform-bit QAT**。Q-ViT 早期 arXiv 版本曾研究 learnable head-wise bit-width，但不能把它误写成当前 NeurIPS 官方代码支持的 12-block layer-wise MPQ。
+
+因此，可主张的研究空白应表述为：**QAT 下对 DeiT/Swin 的所有 Transformer block 联合选择 ternary/2/4/8 quantizer，在统一资源预算下学习或搜索层间分配，并与 uniform Q-ViT/OFQ 及现有 PTQ MPQ 基线比较**。
+
+详细文献表、训练类型、粒度、对比要求与 `1.67 bit` 的定义见
+[Swin-T W4A4 public methods survey 的 2026-11-12 addendum](swin_t_w4a4_public_methods_survey_20260704.md#2026-11-12-addendum-layer-wise-mixed-precision-and-ternary-vit)。
