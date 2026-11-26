@@ -1272,6 +1272,15 @@ def depth_profile_block_name(module_name: str) -> Optional[str]:
     return None
 
 
+def _depth_natural_key(name: str) -> Tuple[Tuple[int, object], ...]:
+    key: List[Tuple[int, object]] = []
+    for token in re.split(r"(\d+)", name):
+        if not token:
+            continue
+        key.append((0, int(token)) if token.isdigit() else (1, token))
+    return tuple(key)
+
+
 def depth_profile_block_names(module_names: Sequence[str]) -> Tuple[str, ...]:
     """Collect Transformer blocks in stable natural depth order."""
     blocks = {
@@ -1279,16 +1288,17 @@ def depth_profile_block_names(module_names: Sequence[str]) -> Tuple[str, ...]:
         for name in module_names
         if (block := depth_profile_block_name(name)) is not None
     }
+    return tuple(sorted(blocks, key=_depth_natural_key))
 
-    def natural_key(name: str) -> Tuple[Tuple[int, object], ...]:
-        key: List[Tuple[int, object]] = []
-        for token in re.split(r"(\d+)", name):
-            if not token:
-                continue
-            key.append((0, int(token)) if token.isdigit() else (1, token))
-        return tuple(key)
 
-    return tuple(sorted(blocks, key=natural_key))
+def depth_profile_submodule_names(module_names: Sequence[str]) -> Tuple[str, ...]:
+    """Collect Transformer attn/mlp submodules in stable natural depth order."""
+    submodules = {
+        str(name)
+        for name in module_names
+        if depth_profile_block_name(str(name)) is not None
+    }
+    return tuple(sorted(submodules, key=_depth_natural_key))
 
 
 def progressive_bits_for_epoch(schedule: Sequence[Tuple[int, int, int]], epoch: int, default_wbits: int, default_abits: int) -> Tuple[int, int]:
@@ -2822,20 +2832,31 @@ def build_ofq_qconfigs(runtime_args: SimpleNamespace) -> Dict[str, Dict[str, obj
     }
     qconfigs: Dict[str, Dict[str, object]] = {}
     block_names = depth_profile_block_names(runtime_args.qmodules)
+    submodule_names = depth_profile_submodule_names(runtime_args.qmodules)
     weight_profile = tuple(getattr(runtime_args, "depth_weight_bit_profile", ()) or ())
     act_profile = tuple(getattr(runtime_args, "depth_act_bit_profile", ()) or ())
     for label, profile in (("weight", weight_profile), ("activation", act_profile)):
-        if profile and len(profile) != len(block_names):
+        if profile and len(profile) not in {len(block_names), len(submodule_names)}:
             raise ValueError(
                 f"depth {label} bit profile has {len(profile)} entries but model has "
-                f"{len(block_names)} Transformer blocks: {block_names}"
+                f"{len(block_names)} blocks / {len(submodule_names)} submodules"
             )
-    weight_bits_by_block = dict(zip(block_names, weight_profile)) if weight_profile else {}
-    act_bits_by_block = dict(zip(block_names, act_profile)) if act_profile else {}
+    weight_bits_by_name = (
+        dict(zip(submodule_names if len(weight_profile) == len(submodule_names) else block_names, weight_profile))
+        if weight_profile
+        else {}
+    )
+    act_bits_by_name = (
+        dict(zip(submodule_names if len(act_profile) == len(submodule_names) else block_names, act_profile))
+        if act_profile
+        else {}
+    )
     for module_name in runtime_args.qmodules:
         block_name = depth_profile_block_name(module_name)
-        module_wbits = int(weight_bits_by_block.get(block_name, runtime_args.wq_bitw))
-        module_abits = int(act_bits_by_block.get(block_name, runtime_args.aq_bitw))
+        w_key = module_name if module_name in weight_bits_by_name else block_name
+        a_key = module_name if module_name in act_bits_by_name else block_name
+        module_wbits = int(weight_bits_by_name.get(w_key, runtime_args.wq_bitw))
+        module_abits = int(act_bits_by_name.get(a_key, runtime_args.aq_bitw))
         wcfg = {
             "mode": runtime_args.wq_mode if runtime_args.wq_enable else "Identity",
             "bit": module_wbits if module_wbits < 32 and runtime_args.aq_enable else "identity",
