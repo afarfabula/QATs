@@ -2740,6 +2740,49 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     )
     defaults["model_ema"] = bool(defaults.get("model_ema", False))
     defaults["model_ema_decay"] = float(defaults.get("model_ema_decay", 0.9999))
+    defaults["staircase_mask_enable"] = os.environ.get("STAIRCASE_MASK_ENABLE", "0") == "1"
+    default_curriculum = "1" if defaults["staircase_mask_enable"] else "0"
+    defaults["staircase_curriculum_enable"] = os.environ.get("STAIRCASE_CURRICULUM_ENABLE", default_curriculum) == "1"
+    defaults["staircase_stage_epochs"] = parse_int_tuple_env("STAIRCASE_STAGE_EPOCHS", "4,2,14")
+    defaults["staircase_mask_interval"] = max(1, int(os.environ.get("STAIRCASE_MASK_INTERVAL", "1000")))
+    defaults["staircase_mask_seed"] = int(os.environ.get("STAIRCASE_MASK_SEED", "42"))
+    defaults["staircase_mask_resample_random"] = os.environ.get("STAIRCASE_MASK_RESAMPLE_RANDOM", "0") == "1"
+    defaults["staircase_aux"] = os.environ.get("STAIRCASE_AUX", "none").strip().lower()
+    defaults["staircase_freeze_stage_teacher"] = os.environ.get("STAIRCASE_FREEZE_STAGE_TEACHER", "1") == "1"
+    defaults["staircase_rescale_lsq"] = os.environ.get("STAIRCASE_RESCALE_LSQ", "1") == "1"
+    defaults["staircase_debug"] = os.environ.get("STAIRCASE_DEBUG", "1") == "1"
+    defaults["staircase_smoke_batches"] = max(0, int(os.environ.get("STAIRCASE_SMOKE_BATCHES", "0")))
+    defaults["mixed_bit_gate_enable"] = os.environ.get("MIXED_BIT_GATE_ENABLE", "0") == "1"
+    defaults["mixed_bit_target_bits"] = float(os.environ.get("MIXED_BIT_TARGET_BITS", "2.0"))
+    defaults["mixed_bit_budget_tol"] = float(os.environ.get("MIXED_BIT_BUDGET_TOL", "0.015"))
+    defaults["mixed_bit_budget_weight"] = float(os.environ.get("MIXED_BIT_BUDGET_WEIGHT", "20.0"))
+    defaults["mixed_bit_search_start_epoch"] = int(os.environ.get("MIXED_BIT_SEARCH_START_EPOCH", "2"))
+    defaults["mixed_bit_hard_start_epoch"] = int(os.environ.get("MIXED_BIT_HARD_START_EPOCH", "10"))
+    defaults["mixed_bit_freeze_epoch"] = int(os.environ.get("MIXED_BIT_FREEZE_EPOCH", "14"))
+    defaults["mixed_bit_weight_ramp_epochs"] = int(os.environ.get("MIXED_BIT_WEIGHT_RAMP_EPOCHS", "4"))
+    defaults["mixed_bit_gate_lr"] = float(os.environ.get("MIXED_BIT_GATE_LR", "0.002"))
+    defaults["mixed_bit_tau_start"] = float(os.environ.get("MIXED_BIT_TAU_START", "1.5"))
+    defaults["mixed_bit_tau_mid"] = float(os.environ.get("MIXED_BIT_TAU_MID", "0.4"))
+    defaults["mixed_bit_tau_end"] = float(os.environ.get("MIXED_BIT_TAU_END", "0.25"))
+    defaults["mixed_bit_init_logits"] = tuple(
+        float(item.strip())
+        for item in os.environ.get("MIXED_BIT_INIT_LOGITS", "0.0,1.5,0.0").split(",")
+        if item.strip()
+    )
+    defaults["mixed_bit_hard_budget"] = os.environ.get("MIXED_BIT_HARD_BUDGET", "1") == "1"
+    defaults["mixed_bit_smoke_batches"] = max(0, int(os.environ.get("MIXED_BIT_SMOKE_BATCHES", "0")))
+    if defaults["staircase_aux"] not in {"none", "rank", "kl"}:
+        raise ValueError(f"STAIRCASE_AUX must be none/rank/kl, got {defaults['staircase_aux']!r}")
+    if len(defaults["staircase_stage_epochs"]) != 3:
+        raise ValueError(f"STAIRCASE_STAGE_EPOCHS must contain 3 integers, got {defaults['staircase_stage_epochs']}")
+    if defaults["staircase_curriculum_enable"] and sum(defaults["staircase_stage_epochs"]) != int(defaults.get("epochs", 20)):
+        raise ValueError(
+            "STAIRCASE_STAGE_EPOCHS must sum to epochs: "
+            f"stages={defaults['staircase_stage_epochs']}, epochs={defaults.get('epochs')}"
+        )
+    if defaults["staircase_curriculum_enable"] and defaults["staircase_aux"] != "none":
+        defaults["train_scheme"] = "ema_ref_attn_kl"
+        defaults["staircase_freeze_stage_teacher"] = True
     defaults["no_prefetcher"] = bool(defaults.get("no_prefetcher", False))
     defaults["prefetcher"] = not defaults["no_prefetcher"]
     defaults["sync_step_timing"] = bool(defaults.get("sync_step_timing", False))
@@ -2918,6 +2961,9 @@ def save_step_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, run
         save_state["lr_scheduler"] = lr_scheduler.state_dict()
     if model_ema is not None:
         save_state["state_dict_ema"] = get_state_dict(model_ema)
+    staircase_state = collect_staircase_policy_state(runtime_args)
+    if staircase_state:
+        save_state["staircase_policy_state"] = staircase_state
     save_path = step_dir / f"{step_tag}.pth.tar"
     tmp_path = step_dir / f".{save_path.name}.tmp"
     torch.save(save_state, tmp_path)
@@ -2987,6 +3033,9 @@ def save_epoch_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, ru
         state["lr_scheduler"] = lr_scheduler.state_dict()
     if model_ema is not None:
         state["state_dict_ema"] = get_state_dict(model_ema)
+    staircase_state = collect_staircase_policy_state(runtime_args)
+    if staircase_state:
+        state["staircase_policy_state"] = staircase_state
     checkpoint_path = output_dir / f"checkpoint-{epoch + 1}{suffix}.pth.tar"
     last_path = output_dir / ("last.pth.tar" if not suffix else f"last{suffix}.pth.tar")
     tmp_path = output_dir / f".{checkpoint_path.name}.tmp"
@@ -5394,6 +5443,270 @@ def set_fake_quant_bits(model: nn.Module, wbits: int, abits: int, rescale_lsq: b
     return weight_modules, act_modules
 
 
+def _update_fake_quant_bit(quantizer, new_bit: int, rescale_lsq: bool = False) -> None:
+    old_bit = int(getattr(quantizer, "bit", new_bit))
+    old_all_positive = bool(getattr(quantizer, "all_positive", False))
+    old_thd_pos = getattr(quantizer, "thd_pos", quant_thresholds(old_bit, old_all_positive)[1])
+    new_thd_neg, new_thd_pos = quant_thresholds(new_bit, old_all_positive)
+    quantizer.bit = int(new_bit)
+    if hasattr(quantizer, "thd_neg"):
+        quantizer.thd_neg = new_thd_neg
+    if hasattr(quantizer, "thd_pos"):
+        quantizer.thd_pos = new_thd_pos
+    scale = getattr(quantizer, "s", None)
+    if rescale_lsq and scale is not None and old_bit != int(new_bit):
+        try:
+            ratio = math.sqrt(float(old_thd_pos) / float(new_thd_pos))
+            with torch.no_grad():
+                scale.mul_(ratio)
+        except Exception:
+            pass
+
+
+def set_named_module_fake_quant_bits(
+    model: nn.Module,
+    module_name: str,
+    wbits: int,
+    abits: int,
+    rescale_lsq: bool = False,
+) -> None:
+    root = maybe_unwrap_ddp(model)
+    try:
+        module = root.get_submodule(module_name)
+    except AttributeError:
+        return
+    for submodule in module.modules():
+        if hasattr(submodule, "weight_bits"):
+            submodule.weight_bits = int(wbits)
+        if hasattr(submodule, "input_bits"):
+            submodule.input_bits = int(abits)
+        for attr in ("statsq_fn", "qk_quant", "v_quant"):
+            quantizer = getattr(submodule, attr, None)
+            if quantizer is not None and hasattr(quantizer, "num_bits"):
+                quantizer.num_bits = int(wbits)
+        for attr in ("lsqw_fn",):
+            quantizer = getattr(submodule, attr, None)
+            if quantizer is not None and hasattr(quantizer, "bit"):
+                _update_fake_quant_bit(quantizer, int(wbits), rescale_lsq=rescale_lsq)
+        for attr in ("input_quant_fn", "quant_x_4_qkv", "quan_a_qkx_fn", "quan_a_q_fn", "quan_a_k_fn", "quan_a_v_fn", "quan_a_softmax_fn"):
+            quantizer = getattr(submodule, attr, None)
+            if quantizer is not None and hasattr(quantizer, "bit"):
+                _update_fake_quant_bit(quantizer, int(abits), rescale_lsq=rescale_lsq)
+
+
+def _quantizer_forward_with_staircase_bypass(original_forward):
+    def forward(self, value, *args, **kwargs):
+        if not bool(getattr(self, "staircase_quant_enabled", True)):
+            return value
+        return original_forward(value, *args, **kwargs)
+
+    return forward
+
+
+def install_staircase_quant_bypass_hooks(model: nn.Module, runtime_args: SimpleNamespace) -> int:
+    if not bool(getattr(runtime_args, "staircase_mask_enable", False)):
+        return 0
+    root = maybe_unwrap_ddp(model)
+    installed = 0
+    seen = set()
+    for module_name in getattr(runtime_args, "qmodules", ()):
+        module_name = str(module_name)
+        if depth_profile_block_name(module_name) is None:
+            continue
+        try:
+            module = root.get_submodule(module_name)
+        except AttributeError:
+            continue
+        for submodule in module.modules():
+            quantizers = []
+            for attr in ("statsq_fn", "qk_quant", "v_quant", "lsqw_fn"):
+                quantizer = getattr(submodule, attr, None)
+                if quantizer is not None:
+                    quantizers.append(quantizer)
+            for attr in ("input_quant_fn", "quan_a_qkx_fn", "quan_a_v_fn", "quan_a_softmax_fn", "quan_a_q_fn", "quan_a_k_fn"):
+                quantizer = getattr(submodule, attr, None)
+                if quantizer is not None:
+                    quantizers.append(quantizer)
+            for quantizer in quantizers:
+                if id(quantizer) in seen:
+                    continue
+                seen.add(id(quantizer))
+                if not hasattr(quantizer, "_staircase_original_forward"):
+                    quantizer._staircase_original_forward = quantizer.forward
+                    quantizer.forward = types.MethodType(
+                        _quantizer_forward_with_staircase_bypass(quantizer._staircase_original_forward),
+                        quantizer,
+                    )
+                quantizer.staircase_quant_enabled = True
+                installed += 1
+    return installed
+
+
+def set_named_module_quantization_enabled(model: nn.Module, module_name: str, weight_enabled: bool, act_enabled: bool) -> int:
+    root = maybe_unwrap_ddp(model)
+    try:
+        module = root.get_submodule(module_name)
+    except AttributeError:
+        return 0
+    changed = 0
+    seen = set()
+    for submodule in module.modules():
+        for attr in ("statsq_fn", "qk_quant", "v_quant", "lsqw_fn"):
+            quantizer = getattr(submodule, attr, None)
+            if quantizer is not None and id(quantizer) not in seen:
+                seen.add(id(quantizer))
+                quantizer.staircase_quant_enabled = bool(weight_enabled)
+                changed += 1
+        for attr in ("input_quant_fn", "quan_a_qkx_fn", "quan_a_v_fn", "quan_a_softmax_fn", "quan_a_q_fn", "quan_a_k_fn"):
+            quantizer = getattr(submodule, attr, None)
+            if quantizer is not None and id(quantizer) not in seen:
+                seen.add(id(quantizer))
+                quantizer.staircase_quant_enabled = bool(act_enabled)
+                changed += 1
+    return changed
+
+
+def parse_int_tuple_env(name: str, default: str) -> Tuple[int, ...]:
+    raw = os.environ.get(name, default)
+    return tuple(int(item.strip()) for item in str(raw).split(",") if item.strip())
+
+
+def staircase_stage_index(epoch: int, stage_epochs: Sequence[int]) -> int:
+    cursor = 0
+    for idx, length in enumerate(stage_epochs):
+        cursor += int(length)
+        if epoch < cursor:
+            return idx
+    return len(stage_epochs) - 1
+
+
+def staircase_stage_progress(epoch: int, stage_epochs: Sequence[int], stage_index: int, batch_fraction: float = 0.0) -> float:
+    start = sum(int(item) for item in stage_epochs[:stage_index])
+    length = max(1, int(stage_epochs[stage_index]))
+    return min(1.0, max(0.0, (epoch - start + float(batch_fraction)) / length))
+
+
+def staircase_high_probability(epoch: int, stage_epochs: Sequence[int], stage_index: int, batch_fraction: float) -> float:
+    if stage_index <= 0:
+        return 0.0
+    progress = staircase_stage_progress(epoch, stage_epochs, stage_index, batch_fraction)
+    if stage_index == 1:
+        return max(0.0, 1.0 - progress)
+    # At W2, keep a short overlap with W3, then force W2 for the final half of the stage.
+    return max(0.0, 0.5 * (1.0 - progress / 0.5))
+
+
+def initialize_staircase_mask_state(runtime_args: SimpleNamespace) -> None:
+    if not bool(getattr(runtime_args, "staircase_curriculum_enable", False)):
+        return
+    if hasattr(runtime_args, "_staircase_mask_state"):
+        return
+    seed = int(getattr(runtime_args, "staircase_mask_seed", 42))
+    rng = random.Random(seed)
+    thresholds = {}
+    for module_name in getattr(runtime_args, "qmodules", ()):
+        module_name = str(module_name)
+        if depth_profile_block_name(module_name) is None:
+            continue
+        thresholds[module_name] = {
+            "weight": float(rng.random()),
+            "activation": float(rng.random()),
+        }
+    runtime_args._staircase_mask_state = {
+        "thresholds": thresholds,
+        "current": {},
+        "stage_index": -1,
+    }
+
+
+def collect_staircase_policy_state(runtime_args: SimpleNamespace) -> Dict[str, object]:
+    state = getattr(runtime_args, "_staircase_mask_state", None)
+    if not state:
+        return {}
+    return {
+        "enabled": True,
+        "stage_epochs": list(getattr(runtime_args, "staircase_stage_epochs", ())),
+        "mask_interval": int(getattr(runtime_args, "staircase_mask_interval", 0)),
+        "resample_random": bool(getattr(runtime_args, "staircase_mask_resample_random", False)),
+        "stage_index": int(state.get("stage_index", -1)),
+        "current": copy.deepcopy(state.get("current", {})),
+        "thresholds": copy.deepcopy(state.get("thresholds", {})),
+    }
+
+
+def apply_staircase_mask(
+    model: nn.Module,
+    runtime_args: SimpleNamespace,
+    epoch: int,
+    batch_fraction: float,
+    force: bool = False,
+    emit_log: bool = True,
+    resample: bool = True,
+) -> Tuple[int, int]:
+    if not bool(getattr(runtime_args, "staircase_mask_enable", False)):
+        return 0, 0
+    initialize_staircase_mask_state(runtime_args)
+    stage_epochs = tuple(int(item) for item in getattr(runtime_args, "staircase_stage_epochs", ()))
+    if len(stage_epochs) != 3:
+        raise ValueError(f"staircase_stage_epochs must have exactly 3 stages, got {stage_epochs}")
+    stage_index = staircase_stage_index(epoch, stage_epochs)
+    total_epochs = max(1, int(getattr(runtime_args, "epochs", 20)))
+    p_quant = min(1.0, max(0.0, (float(epoch) + float(batch_fraction)) / float(total_epochs)))
+    state = runtime_args._staircase_mask_state
+    state["stage_index"] = stage_index
+    current = state.setdefault("current", {})
+    random_resample = bool(getattr(runtime_args, "staircase_mask_resample_random", False))
+    sample_rng = None
+    if random_resample and resample:
+        counter = int(state.get("resample_counter", 0))
+        state["resample_counter"] = counter + 1
+        sample_rng = random.Random(int(getattr(runtime_args, "staircase_mask_seed", 42)) + counter * 1000003)
+    changed = 0
+    quantized_modules = 0
+    install_staircase_quant_bypass_hooks(model, runtime_args)
+    for module_name, thresholds in state["thresholds"].items():
+        if sample_rng is not None:
+            quantize_w = sample_rng.random() < p_quant
+            quantize_a = sample_rng.random() < p_quant
+        elif random_resample:
+            previous = current.get(module_name)
+            if previous is None:
+                quantize_w = False
+                quantize_a = False
+            else:
+                quantize_w = bool(previous["weight_quantized"])
+                quantize_a = bool(previous["activation_quantized"])
+        else:
+            quantize_w = thresholds["weight"] < p_quant
+            quantize_a = thresholds["activation"] < p_quant
+        previous = current.get(module_name)
+        next_value = {
+            "weight_quantized": bool(quantize_w),
+            "activation_quantized": bool(quantize_a),
+        }
+        if force or previous != next_value:
+            set_named_module_quantization_enabled(
+                model,
+                module_name,
+                quantize_w,
+                quantize_a,
+            )
+            current[module_name] = next_value
+            changed += 1
+        if quantize_w or quantize_a:
+            quantized_modules += 1
+    if emit_log and bool(getattr(runtime_args, "staircase_debug", False)):
+        rank = int(getattr(runtime_args, "local_rank", 0))
+        if rank == 0:
+            print(
+                "StaircaseMask: "
+                f"epoch={epoch}, stage={stage_index}, p_quant={p_quant:.4f}, "
+                f"quantized_modules={quantized_modules}/{len(current)}, changed={changed}",
+                flush=True,
+            )
+    return changed, quantized_modules
+
+
 def extract_attn_prob_list(attn_info):
     if attn_info is None:
         return []
@@ -6743,22 +7056,43 @@ def create_ofq_optimizer(runtime_args: SimpleNamespace, model: nn.Module) -> tor
     if runtime_args.opt.lower() != "adamw":
         raise NotImplementedError(f"当前 unified OFQ path 仅支持 AdamW，收到: {runtime_args.opt}")
     quant_lr_multiplier = float(getattr(runtime_args, "quant_lr_multiplier", 1.0))
-    if quant_lr_multiplier == 1.0:
+    mixed_bit_gate_enable = bool(getattr(runtime_args, "mixed_bit_gate_enable", False))
+    if quant_lr_multiplier == 1.0 and not mixed_bit_gate_enable:
         return torch.optim.AdamW(model.parameters(), lr=runtime_args.lr, weight_decay=runtime_args.weight_decay, betas=runtime_args.opt_betas, fused=True)
+
+    from mixed_bit_gating import is_mixed_bit_gate_parameter
 
     quant_params = []
     base_params = []
+    gate_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if is_quant_or_shift_parameter(name):
+        if mixed_bit_gate_enable and is_mixed_bit_gate_parameter(name):
+            gate_params.append(param)
+        elif is_quant_or_shift_parameter(name):
             quant_params.append(param)
         else:
             base_params.append(param)
     param_groups = [
         {"params": base_params, "lr": runtime_args.lr, "lr_scale": 1.0},
-        {"params": quant_params, "lr": runtime_args.lr * quant_lr_multiplier, "lr_scale": quant_lr_multiplier},
     ]
+    if quant_params:
+        param_groups.append(
+            {"params": quant_params, "lr": runtime_args.lr * quant_lr_multiplier, "lr_scale": quant_lr_multiplier}
+        )
+    if gate_params:
+        gate_lr = float(getattr(runtime_args, "mixed_bit_gate_lr", 0.002))
+        gate_scale = gate_lr / max(float(runtime_args.lr), 1e-12)
+        param_groups.append(
+            {
+                "params": gate_params,
+                "lr": gate_lr,
+                "weight_decay": 0.0,
+                "lr_scale": gate_scale,
+                "is_mixed_bit_gate": True,
+            }
+        )
     if runtime_args.local_rank == 0:
         print(
             "Using grouped LR: "
@@ -7300,6 +7634,10 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
         runtime_args._aoq_explore_history_state = aoq_history_state
 
     for batch_idx, (input, target) in enumerate(loader):
+        if int(getattr(runtime_args, "staircase_smoke_batches", 0)) > 0 and batch_idx >= int(runtime_args.staircase_smoke_batches):
+            break
+        if int(getattr(runtime_args, "mixed_bit_smoke_batches", 0)) > 0 and batch_idx >= int(runtime_args.mixed_bit_smoke_batches):
+            break
         last_batch = batch_idx == last_idx
         update_step = ((batch_idx + 1) % accum_steps == 0) or last_batch
         aoq_schedule = getattr(runtime_args, "aoq_explore_update_schedule", None) or []
@@ -8149,6 +8487,28 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                             f"start_update={runtime_args.delta_direction_anchor_start_update}"
                         )
 
+            if (
+                bool(getattr(runtime_args, "mixed_bit_gate_enable", False))
+                and not bool(getattr(runtime_args, "_mixed_bit_frozen", False))
+                and float(getattr(runtime_args, "_mixed_bit_active_bit_weight", 0.0)) > 0.0
+            ):
+                from mixed_bit_gating import compute_mixed_bit_budget_loss
+
+                mbg_loss, mbg_soft_bits, mbg_hard_bits = compute_mixed_bit_budget_loss(
+                    model,
+                    runtime_args,
+                    tau=float(getattr(runtime_args, "_mixed_bit_active_tau", 1.0)),
+                    bit_weight=float(getattr(runtime_args, "_mixed_bit_active_bit_weight", 0.0)),
+                    use_hard=bool(getattr(runtime_args, "_mixed_bit_use_hard_budget", False)),
+                )
+                loss = loss + mbg_loss.to(dtype=loss.dtype)
+                if runtime_args.local_rank == 0 and update_step and (local_update_count % 200 == 0 or last_batch):
+                    print(
+                        f"MixedBitGateStep: epoch={epoch} update={local_update_count} "
+                        f"soft_bits={mbg_soft_bits:.4f} hard_bits={mbg_hard_bits:.4f} "
+                        f"bit_loss={float(mbg_loss.detach().item()):.5f}"
+                    )
+
             loss_for_log = loss.detach()
             ref_attn_kl_loss_for_log = ref_attn_kl_loss.detach()
             ref_logit_kl_loss_for_log = ref_logit_kl_loss.detach()
@@ -8193,6 +8553,7 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 and runtime_args.train_scheme == "ema_ref_attn_kl"
                 and ref_model is not None
                 and runtime_args.ref_update == "prev_step"
+                and not bool(getattr(runtime_args, "staircase_freeze_stage_teacher", False))
                 and local_update_count % runtime_args.ref_update_interval == 0
             ):
                 update_ref_model(model, ref_model, 0.0)
@@ -8262,6 +8623,28 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
             )
             local_update_count += 1
             runtime_args._global_train_update += 1
+            if (
+                bool(getattr(runtime_args, "staircase_mask_enable", False))
+                and runtime_args._global_train_update % int(runtime_args.staircase_mask_interval) == 0
+            ):
+                batch_fraction = float(batch_idx + 1) / float(max(1, len(loader)))
+                apply_staircase_mask(
+                    model,
+                    runtime_args,
+                    epoch,
+                    batch_fraction=batch_fraction,
+                    force=True,
+                )
+                if model_ema is not None:
+                    apply_staircase_mask(
+                        model_ema,
+                        runtime_args,
+                        epoch,
+                        batch_fraction=batch_fraction,
+                        force=True,
+                        emit_log=False,
+                        resample=False,
+                    )
             if epoch >= int(getattr(runtime_args, "quant_slow_state_observe_start_epoch", 0)):
                 update_quant_slow_state(
                     model,
@@ -8271,7 +8654,12 @@ def train_one_epoch_ofq(epoch: int, model: nn.Module, loader, optimizer: torch.o
                 )
             if model_ema is not None:
                 update_model_ema(model, model_ema, runtime_args.model_ema_decay)
-            if runtime_args.train_scheme == "ema_ref_attn_kl" and ref_model is not None and runtime_args.ref_update == "ema":
+            if (
+                runtime_args.train_scheme == "ema_ref_attn_kl"
+                and ref_model is not None
+                and runtime_args.ref_update == "ema"
+                and not bool(getattr(runtime_args, "staircase_freeze_stage_teacher", False))
+            ):
                 update_ref_model(model, ref_model, runtime_args.ref_momentum)
             telemetry = update_weight_bin_telemetry(model, runtime_args, local_update_count)
             if runtime_args.local_rank == 0 and telemetry is not None:
@@ -8416,6 +8804,18 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
 
     if runtime_args.quantized:
         model = get_ofq_qat_model(model, runtime_args)
+    if bool(getattr(runtime_args, "mixed_bit_gate_enable", False)):
+        from mixed_bit_gating import install_mixed_bit_gating
+
+        mbg_count = install_mixed_bit_gating(model, runtime_args)
+        if runtime_args.local_rank == 0:
+            print(
+                "Installed MultiBitGatedQuantizer wrappers: "
+                f"wrapped_quantizers={mbg_count}, "
+                f"submodules={len(getattr(runtime_args, '_mixed_bit_gate_entries', ()))}, "
+                f"target_bits={runtime_args.mixed_bit_target_bits}, "
+                f"init_logits={runtime_args.mixed_bit_init_logits}"
+            )
     if runtime_args.attention_softmax_quantizer != "lsq":
         configured = configure_attention_softmax_quantizer(
             model,
@@ -8876,7 +9276,11 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[local_rank],
-            find_unused_parameters=runtime_args.quant_only_start_epoch is not None,
+            find_unused_parameters=(
+                runtime_args.quant_only_start_epoch is not None
+                or bool(getattr(runtime_args, "staircase_mask_enable", False))
+                or bool(getattr(runtime_args, "mixed_bit_gate_enable", False))
+            ),
             static_graph=runtime_args.static_graph,
             gradient_as_bucket_view=runtime_args.gradient_as_bucket_view,
         )
@@ -9075,6 +9479,58 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                         "Applied teacher attention-output weight override: "
                         f"epoch={epoch}, weight={teacher_attn_output_weight_override}"
                     )
+            staircase_stage_before = None
+            staircase_stage_now = None
+            if bool(getattr(runtime_args, "staircase_curriculum_enable", False)):
+                initialize_staircase_mask_state(runtime_args)
+                staircase_state = runtime_args._staircase_mask_state
+                staircase_stage_before = int(staircase_state.get("stage_index", -1))
+                staircase_stage_now = staircase_stage_index(epoch, runtime_args.staircase_stage_epochs)
+                if (
+                    staircase_stage_before >= 0
+                    and staircase_stage_now > staircase_stage_before
+                    and model_ema is not None
+                ):
+                    if ref_model is not None:
+                        ref_model = clone_ref_model(model_ema)
+                        apply_ref_head_mode_to_models(
+                            runtime_args.ref_head_mode,
+                            model,
+                            teacher,
+                            ref_model,
+                            anchor_ref_model,
+                            runtime_args,
+                        )
+                    if runtime_args.local_rank == 0:
+                        print(
+                            "Captured staircase stage teacher: "
+                            f"epoch={epoch}, from_stage={staircase_stage_before}, "
+                            f"to_stage={staircase_stage_now}, source=previous-stage EMA"
+                        )
+                aux = str(getattr(runtime_args, "staircase_aux", "none"))
+                if staircase_stage_now == 0:
+                    staircase_aux_weight = 0.0
+                elif staircase_stage_now == 1:
+                    staircase_aux_weight = 0.03 if epoch == sum(runtime_args.staircase_stage_epochs[:1]) else 0.05
+                else:
+                    target_start = sum(runtime_args.staircase_stage_epochs[:2])
+                    staircase_aux_weight = 0.08 if epoch < target_start + 2 else 0.10
+                if aux == "rank":
+                    runtime_args.attn_rank_weight = staircase_aux_weight
+                    runtime_args.ref_attn_kl_weight = 0.0
+                elif aux == "kl":
+                    runtime_args.attn_rank_weight = 0.0
+                    runtime_args.ref_attn_kl_weight = staircase_aux_weight
+                else:
+                    runtime_args.attn_rank_weight = 0.0
+                    runtime_args.ref_attn_kl_weight = 0.0
+                if runtime_args.local_rank == 0:
+                    print(
+                        "Staircase auxiliary schedule: "
+                        f"epoch={epoch}, stage={staircase_stage_now}, aux={aux}, "
+                        f"rank_weight={runtime_args.attn_rank_weight}, "
+                        f"kl_weight={runtime_args.ref_attn_kl_weight}"
+                    )
             if runtime_args.progressive_bit_schedule:
                 scheduled_wbits, scheduled_abits = progressive_bits_for_epoch(
                     runtime_args.progressive_bit_schedule,
@@ -9143,6 +9599,27 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                 del transition_anchor_model
                 active_wbits = scheduled_wbits
                 active_abits = scheduled_abits
+            if bool(getattr(runtime_args, "staircase_curriculum_enable", False)):
+                if staircase_stage_now > staircase_stage_before and model_ema is not None:
+                    model_ema = clone_model_ema(model)
+            if bool(getattr(runtime_args, "staircase_mask_enable", False)):
+                apply_staircase_mask(
+                    model,
+                    runtime_args,
+                    epoch,
+                    batch_fraction=0.0,
+                    force=True,
+                )
+                if model_ema is not None:
+                    apply_staircase_mask(
+                        model_ema,
+                        runtime_args,
+                        epoch,
+                        batch_fraction=0.0,
+                        force=True,
+                        emit_log=False,
+                        resample=False,
+                    )
             epoch_lr_override = runtime_args.epoch_lr_overrides.get(epoch)
             if epoch_lr_override is not None:
                 lr_scheduler.base_lr = float(epoch_lr_override)
@@ -9175,6 +9652,65 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                 _n_frozen = freeze_attention_softmax_scales(model)
                 if runtime_args.local_rank == 0:
                     print(f"[DSH] froze attention softmax scales: {_n_frozen} tensors", flush=True)
+            if bool(getattr(runtime_args, "mixed_bit_gate_enable", False)):
+                from mixed_bit_gating import (
+                    apply_mixed_bit_schedule_to_model,
+                    enforce_frozen_mixed_bit_grad,
+                    freeze_mixed_bit_gate,
+                    mixed_bit_schedule_for_epoch,
+                    set_gate_optimizer_lr_scale,
+                    summarize_mixed_bit_gate,
+                )
+
+                mbg_sched = mixed_bit_schedule_for_epoch(epoch, runtime_args)
+                runtime_args._mixed_bit_active_tau = float(mbg_sched["tau"])
+                runtime_args._mixed_bit_active_bit_weight = float(mbg_sched["bit_weight"])
+                runtime_args._mixed_bit_use_hard_budget = bool(mbg_sched.get("use_hard_budget", False))
+                if bool(mbg_sched["should_freeze"]):
+                    if not bool(getattr(runtime_args, "_mixed_bit_frozen", False)):
+                        frozen_mean, choice_map = freeze_mixed_bit_gate(model, runtime_args, model_ema=model_ema)
+                        if runtime_args.local_rank == 0:
+                            summary = summarize_mixed_bit_gate(model, float(mbg_sched["tau"]))
+                            print(
+                                f"MixedBitGateFrozen: epoch={epoch} hard_mean_bits={frozen_mean:.4f} "
+                                f"counts={summary.get('counts')} profile={summary.get('profile')}",
+                                flush=True,
+                            )
+                    enforce_frozen_mixed_bit_grad(model)
+                    set_gate_optimizer_lr_scale(optimizer, 0.0)
+                else:
+                    apply_mixed_bit_schedule_to_model(
+                        model,
+                        gate_active=bool(mbg_sched["gate_active"]),
+                        tau=float(mbg_sched["tau"]),
+                        use_hard=bool(mbg_sched["use_hard"]),
+                        eval_use_argmax=bool(mbg_sched["use_hard"]),
+                    )
+                    if model_ema is not None:
+                        apply_mixed_bit_schedule_to_model(
+                            model_ema,
+                            gate_active=False,
+                            tau=float(mbg_sched["tau"]),
+                            use_hard=bool(mbg_sched["use_hard"]),
+                            eval_use_argmax=bool(mbg_sched["use_hard"]),
+                        )
+                    gate_lr_scale = (
+                        float(getattr(runtime_args, "mixed_bit_gate_lr", 0.002)) / max(float(runtime_args.lr), 1e-12)
+                        if bool(mbg_sched["gate_active"])
+                        else 0.0
+                    )
+                    set_gate_optimizer_lr_scale(optimizer, gate_lr_scale)
+                    if runtime_args.local_rank == 0:
+                        summary = summarize_mixed_bit_gate(model, float(mbg_sched["tau"]))
+                        print(
+                            f"MixedBitGateSchedule: epoch={epoch} phase={mbg_sched['phase']} "
+                            f"gate_active={mbg_sched['gate_active']} use_hard={mbg_sched['use_hard']} "
+                            f"tau={mbg_sched['tau']:.3f} bit_weight={mbg_sched['bit_weight']:.2f} "
+                            f"soft_bits={summary.get('soft_mean_bits', 0.0):.4f} "
+                            f"hard_bits={summary.get('hard_mean_bits', 0.0):.4f} "
+                            f"counts={summary.get('counts')}",
+                            flush=True,
+                        )
 
             train_metrics, total_update_count, stopped_early = train_one_epoch_ofq(
                 epoch,
@@ -9204,6 +9740,40 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
                     print(f"[DSH-PROBE] failed: {_probe_err!r}", flush=True)
             if runtime_args.local_rank == 0:
                 print("epoch: ", epoch, "g['lr']: ", optimizer.param_groups[0]["lr"])
+                if bool(getattr(runtime_args, "mixed_bit_gate_enable", False)):
+                    from mixed_bit_gating import summarize_mixed_bit_gate
+
+                    summary = summarize_mixed_bit_gate(
+                        model, float(getattr(runtime_args, "_mixed_bit_active_tau", 1.0))
+                    )
+                    print(
+                        f"MixedBitGateEpochEnd: epoch={epoch} "
+                        f"soft_bits={summary.get('soft_mean_bits', 0.0):.4f} "
+                        f"hard_bits={summary.get('hard_mean_bits', 0.0):.4f} "
+                        f"counts={summary.get('counts')} profile={summary.get('profile')}",
+                        flush=True,
+                    )
+            if (
+                bool(getattr(runtime_args, "staircase_mask_enable", False))
+                and epoch + 1 >= runtime_args.epochs
+            ):
+                apply_staircase_mask(
+                    model,
+                    runtime_args,
+                    epoch,
+                    batch_fraction=1.0,
+                    force=True,
+                )
+                if model_ema is not None:
+                    apply_staircase_mask(
+                        model_ema,
+                        runtime_args,
+                        epoch,
+                        batch_fraction=1.0,
+                        force=True,
+                        emit_log=False,
+                        resample=False,
+                    )
             post_epoch_feature_recon_updates = int(getattr(runtime_args, "post_epoch_feature_recon_updates", 0))
             if post_epoch_feature_recon_updates > 0:
                 run_pre_qat_feature_reconstruction(
@@ -9677,6 +10247,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-rank-probe", dest="attn_rank_probe", action="store_true", help="只跑一次：打印 base loss 与 attn-ranking 在共享 attention 张量上的梯度范数比，用来定权重")
     parser.add_argument("--attn-rank-target", dest="attn_rank_target", type=str, default=None, choices=["post_quant", "post_quant_detached_scale", "pre_quant"], help="ranking 收集哪一份注意力：post_quant(默认)/post_quant_detached_scale(切断到 softmax 量化步长 s 的梯度)/pre_quant")
     parser.add_argument("--freeze-attn-softmax-scale", dest="freeze_attn_softmax_scale", action="store_true", help="冻结所有注意力 softmax 激活量化器的 LSQ 步长 s(阻断“缩小 s 把注意力尾部打成 0”的作弊路径)")
+    parser.add_argument("--attention-softmax-post-quant-renorm", dest="attention_softmax_post_quant_renorm", action="store_true", help="量化后按行重新归一化 attention，避免 rank/KL 被零值尾部退化影响")
     parser.add_argument("--freeze-param-suffix", dest="freeze_param_suffix", type=str, default=None, help="按参数名子串粘性冻结参数(逗号分隔),例如 move_qkx_b4.bias,move_qkx_aft.bias")
     parser.add_argument("--attn-rank-hinge", dest="attn_rank_hinge", action="store_true", help="用 relu(margin-Delta) 替代 softplus(-Delta):满足 margin 后梯度为 0,消除“把注意力越推越尖”的压力")
     parser.add_argument("--attn-rank-margin", dest="attn_rank_margin", type=float, default=None, help="hinge 的目标 margin(默认 0)")
