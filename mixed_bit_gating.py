@@ -21,6 +21,44 @@ CANDIDATE_BITS: Tuple[int, ...] = (0, 2, 3)
 EFFECTIVE_BITS: Tuple[float, ...] = (math.log2(3.0), 2.0, 3.0)
 BIT_LABELS: Tuple[str, ...] = ("T", "2", "3")
 
+
+def parse_candidate_bits(
+    spec: Optional[object],
+) -> Tuple[Tuple[int, ...], Tuple[float, ...], Tuple[str, ...]]:
+    """Parse mixed-bit candidate specification into (bits, effective_bits, labels)."""
+    if spec is None:
+        return CANDIDATE_BITS, EFFECTIVE_BITS, BIT_LABELS
+    if isinstance(spec, str):
+        raw_items = [item.strip() for item in spec.split(",") if item.strip()]
+        if not raw_items:
+            return CANDIDATE_BITS, EFFECTIVE_BITS, BIT_LABELS
+    else:
+        raw_items = [str(item).strip() for item in spec if str(item).strip()]
+        if not raw_items:
+            return CANDIDATE_BITS, EFFECTIVE_BITS, BIT_LABELS
+
+    cand_bits: List[int] = []
+    eff_bits: List[float] = []
+    labels: List[str] = []
+    for tok in raw_items:
+        if tok.upper() == "T" or tok == "0":
+            cand_bits.append(0)
+            eff_bits.append(math.log2(3.0))
+            labels.append("T")
+        else:
+            b = int(tok)
+            if b < 2:
+                raise ValueError(f"Mixed-bit candidate integer must be >= 2 or T/0, got {tok!r}")
+            cand_bits.append(b)
+            eff_bits.append(float(b))
+            labels.append(str(b))
+
+    if len(cand_bits) < 2:
+        raise ValueError(f"Mixed-bit candidates must contain at least 2 entries, got {spec!r}")
+    if any(eff_bits[i] >= eff_bits[i + 1] for i in range(len(eff_bits) - 1)):
+        raise ValueError(f"Mixed-bit candidates must be strictly ascending in bit-width, got {spec!r}")
+    return tuple(cand_bits), tuple(eff_bits), tuple(labels)
+
 WEIGHT_QUANT_ATTRS: Tuple[str, ...] = ("statsq_fn", "qk_quant", "v_quant", "lsqw_fn")
 ACT_QUANT_ATTRS: Tuple[str, ...] = (
     "input_quant_fn",
@@ -144,9 +182,10 @@ def install_mixed_bit_gating(model: nn.Module, runtime_args: SimpleNamespace) ->
     if not bool(getattr(runtime_args, "mixed_bit_gate_enable", False)):
         return 0
     root = maybe_unwrap_ddp(model)
+    cand_bits, eff_bits, bit_labels = parse_candidate_bits(getattr(runtime_args, "mixed_bit_candidates", None))
     init_logits = tuple(float(v) for v in getattr(runtime_args, "mixed_bit_init_logits", (0.0, 1.5, 0.0)))
-    if len(init_logits) != len(CANDIDATE_BITS):
-        raise ValueError(f"mixed_bit_init_logits must have {len(CANDIDATE_BITS)} entries, got {init_logits}")
+    if len(init_logits) != len(cand_bits):
+        raise ValueError(f"mixed_bit_init_logits must have {len(cand_bits)} entries for {cand_bits}, got {init_logits}")
 
     qmodules = sorted(
         (str(name) for name in getattr(runtime_args, "qmodules", ()) if _depth_block_name(str(name)) is not None),
@@ -164,6 +203,9 @@ def install_mixed_bit_gating(model: nn.Module, runtime_args: SimpleNamespace) ->
         param_weight = _compute_submodule_param_weight(owner)
         owner._mixed_bit_param_weight = param_weight
         owner._mixed_bit_module_name = module_name
+        owner._mixed_bit_candidate_bits = cand_bits
+        owner._mixed_bit_effective_bits = eff_bits
+        owner._mixed_bit_labels = bit_labels
         gate_entries.append((module_name, param_weight))
 
         for submodule in owner.modules():
@@ -171,17 +213,20 @@ def install_mixed_bit_gating(model: nn.Module, runtime_args: SimpleNamespace) ->
                 orig_q = getattr(submodule, attr, None)
                 if orig_q is None or isinstance(orig_q, MultiBitGatedQuantizer):
                     continue
-                branches = [_clone_quantizer_for_bit(orig_q, b) for b in CANDIDATE_BITS]
+                branches = [_clone_quantizer_for_bit(orig_q, b) for b in cand_bits]
                 setattr(submodule, attr, MultiBitGatedQuantizer(branches, owner, module_name, is_weight=True))
                 installed += 1
             for attr in ACT_QUANT_ATTRS:
                 orig_q = getattr(submodule, attr, None)
                 if orig_q is None or isinstance(orig_q, MultiBitGatedQuantizer):
                     continue
-                branches = [_clone_quantizer_for_bit(orig_q, b) for b in CANDIDATE_BITS]
+                branches = [_clone_quantizer_for_bit(orig_q, b) for b in cand_bits]
                 setattr(submodule, attr, MultiBitGatedQuantizer(branches, owner, module_name, is_weight=False))
                 installed += 1
 
+    runtime_args._mixed_bit_candidate_bits = cand_bits
+    runtime_args._mixed_bit_effective_bits = eff_bits
+    runtime_args._mixed_bit_labels = bit_labels
     runtime_args._mixed_bit_gate_entries = gate_entries
     runtime_args._mixed_bit_frozen = False
     return installed
@@ -296,7 +341,8 @@ def compute_mixed_bit_budget_loss(
         return zero, 0.0, 0.0
 
     device = owners[0][1].mixed_bit_alpha.device
-    eff_bits = torch.tensor(EFFECTIVE_BITS, device=device, dtype=torch.float32)
+    eff_bits_tuple = tuple(getattr(owners[0][1], "_mixed_bit_effective_bits", EFFECTIVE_BITS))
+    eff_bits = torch.tensor(eff_bits_tuple, device=device, dtype=torch.float32)
     soft_num = torch.zeros((), device=device, dtype=torch.float32)
     budget_num = torch.zeros((), device=device, dtype=torch.float32)
     hard_num = 0.0
@@ -309,9 +355,9 @@ def compute_mixed_bit_budget_loss(
         y_soft = F.softmax(alpha * inv_tau, dim=0)
         soft_num = soft_num + w * (y_soft * eff_bits).sum()
         hard_idx = int(alpha.detach().argmax().item())
-        hard_num += w * float(EFFECTIVE_BITS[hard_idx])
+        hard_num += w * float(eff_bits_tuple[hard_idx])
         if use_hard:
-            y_hard = F.one_hot(alpha.detach().argmax(), num_classes=len(EFFECTIVE_BITS)).to(dtype=y_soft.dtype)
+            y_hard = F.one_hot(alpha.detach().argmax(), num_classes=len(eff_bits_tuple)).to(dtype=y_soft.dtype)
             budget_probs = (y_hard - y_soft).detach() + y_soft
         else:
             budget_probs = y_soft
@@ -338,12 +384,13 @@ def _exact_budget_round_choices(
     target_bits: float,
     tol_low: float = 0.02,
     tol_high: float = 0.015,
+    effective_bits: Sequence[float] = EFFECTIVE_BITS,
 ) -> List[int]:
     choices = [int(a.detach().argmax().item()) for a in alphas]
     total_w = max(1e-8, sum(weights))
 
     def mean_bits(ch: Sequence[int]) -> float:
-        return sum(w * EFFECTIVE_BITS[c] for w, c in zip(weights, ch)) / total_w
+        return sum(w * effective_bits[c] for w, c in zip(weights, ch)) / total_w
 
     cur = mean_bits(choices)
     max_iters = len(choices) * 2
@@ -356,12 +403,12 @@ def _exact_budget_round_choices(
             vals = alpha.detach().cpu().tolist()
             if need_lower and cur_c > 0:
                 cand_c = cur_c - 1
-            elif (not need_lower) and cur_c < len(EFFECTIVE_BITS) - 1:
+            elif (not need_lower) and cur_c < len(effective_bits) - 1:
                 cand_c = cur_c + 1
             else:
                 continue
             logit_penalty = float(vals[cur_c] - vals[cand_c])
-            new_mean = cur + (weights[idx] * (EFFECTIVE_BITS[cand_c] - EFFECTIVE_BITS[cur_c])) / total_w
+            new_mean = cur + (weights[idx] * (effective_bits[cand_c] - effective_bits[cur_c])) / total_w
             overshoots = (new_mean < target_bits - tol_low) if need_lower else (new_mean > target_bits + tol_high)
             dist_to_target = abs(new_mean - target_bits)
             score = (1 if overshoots else 0, logit_penalty, dist_to_target)
@@ -386,10 +433,11 @@ def freeze_mixed_bit_gate(
 
     alphas = [owner.mixed_bit_alpha for _, owner in owners]
     weights = [float(getattr(owner, "_mixed_bit_param_weight", 1.0)) for _, owner in owners]
+    eff_bits = tuple(getattr(owners[0][1], "_mixed_bit_effective_bits", EFFECTIVE_BITS))
     target_bits = float(getattr(runtime_args, "mixed_bit_target_bits", 2.0))
 
     if bool(getattr(runtime_args, "local_rank", 0) == 0):
-        choices_list = _exact_budget_round_choices(alphas, weights, target_bits)
+        choices_list = _exact_budget_round_choices(alphas, weights, target_bits, effective_bits=eff_bits)
     else:
         choices_list = [0] * len(owners)
 
@@ -423,7 +471,7 @@ def freeze_mixed_bit_gate(
                         mod.use_hard = True
 
     total_w = max(1e-8, sum(weights))
-    hard_mean = sum(w * EFFECTIVE_BITS[c] for w, c in zip(weights, choices_list)) / total_w
+    hard_mean = sum(w * eff_bits[c] for w, c in zip(weights, choices_list)) / total_w
     runtime_args._mixed_bit_frozen = True
     runtime_args._mixed_bit_frozen_choices = choice_map
     return hard_mean, choice_map
@@ -433,11 +481,13 @@ def summarize_mixed_bit_gate(model: nn.Module, tau: float) -> Dict[str, object]:
     owners = iter_gate_owners(model)
     if not owners:
         return {}
+    eff_bits = tuple(getattr(owners[0][1], "_mixed_bit_effective_bits", EFFECTIVE_BITS))
+    labels = tuple(getattr(owners[0][1], "_mixed_bit_labels", BIT_LABELS))
     inv_tau = 1.0 / max(float(tau), 1e-4)
     soft_sum = 0.0
     hard_sum = 0.0
     denom = 0.0
-    counts = {"T": 0, "2": 0, "3": 0}
+    counts = {lbl: 0 for lbl in labels}
     tokens = []
     for name, owner in owners:
         w = float(getattr(owner, "_mixed_bit_param_weight", 1.0))
@@ -449,10 +499,10 @@ def summarize_mixed_bit_gate(model: nn.Module, tau: float) -> Dict[str, object]:
                 frozen_idx = mod.frozen_idx
                 break
         hard_idx = int(frozen_idx) if frozen_idx is not None else int(alpha.argmax().item())
-        soft_sum += w * sum(float(probs[i].item()) * EFFECTIVE_BITS[i] for i in range(len(EFFECTIVE_BITS)))
-        hard_sum += w * EFFECTIVE_BITS[hard_idx]
+        soft_sum += w * sum(float(probs[i].item()) * eff_bits[i] for i in range(len(eff_bits)))
+        hard_sum += w * eff_bits[hard_idx]
         denom += w
-        label = BIT_LABELS[hard_idx]
+        label = labels[hard_idx]
         counts[label] += 1
         short = name.replace("blocks.", "b").replace(".attn", "A").replace(".mlp", "M")
         tokens.append(f"{short}:{label}")

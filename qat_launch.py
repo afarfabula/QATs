@@ -2763,6 +2763,7 @@ def build_ofq_runtime_config(args: argparse.Namespace) -> SimpleNamespace:
     defaults["staircase_debug"] = os.environ.get("STAIRCASE_DEBUG", "1") == "1"
     defaults["staircase_smoke_batches"] = max(0, int(os.environ.get("STAIRCASE_SMOKE_BATCHES", "0")))
     defaults["mixed_bit_gate_enable"] = os.environ.get("MIXED_BIT_GATE_ENABLE", "0") == "1"
+    defaults["mixed_bit_candidates"] = os.environ.get("MIXED_BIT_CANDIDATES", "T,2,3")
     defaults["mixed_bit_target_bits"] = float(os.environ.get("MIXED_BIT_TARGET_BITS", "2.0"))
     defaults["mixed_bit_budget_tol"] = float(os.environ.get("MIXED_BIT_BUDGET_TOL", "0.015"))
     defaults["mixed_bit_budget_weight"] = float(os.environ.get("MIXED_BIT_BUDGET_WEIGHT", "20.0"))
@@ -8833,6 +8834,7 @@ def run_unified_ofq(local_rank: int, runtime_args: SimpleNamespace) -> None:
             print(
                 "Installed MultiBitGatedQuantizer wrappers: "
                 f"wrapped_quantizers={mbg_count}, "
+                f"candidates={getattr(runtime_args, 'mixed_bit_candidates', 'T,2,3')}, "
                 f"submodules={len(getattr(runtime_args, '_mixed_bit_gate_entries', ()))}, "
                 f"target_bits={runtime_args.mixed_bit_target_bits}, "
                 f"init_logits={runtime_args.mixed_bit_init_logits}"
